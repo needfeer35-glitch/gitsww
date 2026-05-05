@@ -1,142 +1,145 @@
-// =========================================================================
-// ФАЙЛ:  src/main/java/net/autocraft/crafting/CraftingManager.java
-// МЕТОД: handlePlace() — полная замена существующего метода
-//
-// ЧТО ИСПРАВЛЕНО:
-//  1. Правильный подсчёт количества каждого предмета на слот рецепта
-//     (один предмет может встречаться в нескольких слотах shaped-рецепта)
-//  2. Stack splitting: берём ровно нужное количество через правый клик,
-//     а не весь стак левым кликом
-//  3. Если в grid-слоте уже лежит нужный предмет — пропускаем
-//  4. Виртуальный инвентарь корректно списывает точное количество
-//  5. Cursor очищается в конце если что-то осталось на курсоре
-// =========================================================================
+package net.autocraft.crafting;
 
-// -------------------------------------------------------------------------
-// PHASE: PLACE — move ingredients from inventory into grid slots
-// -------------------------------------------------------------------------
-private void handlePlace(MinecraftClient client, ClientPlayerEntity player) {
-    CraftingScreenHandler handler = getCraftingHandler(player);
-    if (handler == null) { cancelCurrent(); return; }
+import net.autocraft.config.CraftingConfig;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.ingame.CraftingScreen;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.ItemStack;
+import net.minecraft.screen.CraftingScreenHandler;
+import net.minecraft.screen.slot.SlotActionType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-    int syncId = handler.syncId;
-    List<Ingredient> ingredients = currentTask.getRecipe().getIngredients();
+public class CraftingManager {
 
-    // ------------------------------------------------------------------
-    // 1. Собираем план: сколько каждого предмета нужно в каждый слот
-    //    Ключ — gridSlot (1..9), значение — пара (invSlot, нужноеКол-во)
-    // ------------------------------------------------------------------
-    // Виртуальная копия инвентаря для планирования без side-effect
-    Map<Integer, ItemStack> invCopy = buildInventoryCopy(handler);
+    private static final Logger LOGGER = LoggerFactory.getLogger("AutoCraft/CraftingManager");
 
-    // plan[gridIndex] = {invSlot, count} или null если пусто/уже заполнено
-    record SlotPlan(int invSlot, int needed) {}
-    List<SlotPlan> plan = new ArrayList<>();
+    private boolean active = false;
+    private int craftedCount = 0;
+    private int targetCount = 0;
+    private CraftingConfig config;
+    private ActionQueue actionQueue;
+    private String itemName = "";
 
-    for (int gridIndex = 0; gridIndex < ingredients.size(); gridIndex++) {
-        Ingredient ingredient = ingredients.get(gridIndex);
-        int gridSlot = GRID_START + gridIndex;
+    private static CraftingManager INSTANCE;
 
-        if (ingredient.isEmpty()) {
-            plan.add(null);
-            continue;
-        }
-
-        // Проверяем, что уже лежит в слоте верстака
-        ItemStack existing = handler.getSlot(gridSlot).getStack();
-        if (!existing.isEmpty() && ingredient.test(existing)) {
-            // Нужный предмет уже в слоте — пропускаем
-            plan.add(null);
-            continue;
-        }
-
-        // Сколько нужно в этот слот — для стандартных рецептов всегда 1
-        // но мы резервируем 1 единицу из инвентаря
-        int needed = 1;
-
-        int invSlot = findIngredientSlot(invCopy, ingredient);
-        if (invSlot == -1) {
-            if (!AutoCraftConfig.get().continueOnMissingResources) {
-                sendChat(client, "§e[AutoCraft] Нет ресурсов для крафта.");
-                finish(client, false);
-                return;
-            }
-            plan.add(null);
-            continue;
-        }
-
-        plan.add(new SlotPlan(invSlot, needed));
-
-        // Списываем виртуально
-        ItemStack virtualStack = invCopy.get(invSlot);
-        virtualStack.decrement(needed);
-        if (virtualStack.isEmpty()) invCopy.remove(invSlot);
+    public static CraftingManager getInstance() {
+        if (INSTANCE == null) INSTANCE = new CraftingManager();
+        return INSTANCE;
     }
 
-    // ------------------------------------------------------------------
-    // 2. Группируем слоты по invSlot: берём из одного источника сразу
-    //    всё нужное количество через splitting, раскладываем по слотам
-    // ------------------------------------------------------------------
-    // invSlot → список grid-слотов куда класть
-    Map<Integer, List<Integer>> sourceToGridSlots = new LinkedHashMap<>();
-    for (int gridIndex = 0; gridIndex < plan.size(); gridIndex++) {
-        SlotPlan sp = plan.get(gridIndex);
-        if (sp == null) continue;
-        sourceToGridSlots
-            .computeIfAbsent(sp.invSlot, k -> new ArrayList<>())
-            .add(GRID_START + gridIndex);
+    private CraftingManager() {}
+
+    public void start(CraftingConfig cfg, String itemName, int amount) {
+        this.config = cfg;
+        this.itemName = itemName;
+        this.targetCount = amount;
+        this.craftedCount = 0;
+        this.active = true;
+        this.actionQueue = new ActionQueue(this::onActionFail);
+        LOGGER.info("[AutoCraft] Начало крафта: {} x{}", itemName, amount);
+        sendChatMessage("§a[Авто крафт] Начало крафта: " + itemName + " x" + amount);
+        buildNextCraftAction();
     }
 
-    for (Map.Entry<Integer, List<Integer>> entry : sourceToGridSlots.entrySet()) {
-        int invSlot         = entry.getKey();
-        List<Integer> slots = entry.getValue();
-        int totalNeeded     = slots.size(); // каждый слот требует 1 штуку
-
-        // Получаем реальный стак в инвентаре
-        ItemStack realStack = handler.getSlot(invSlot).getStack();
-        int available = realStack.getCount();
-
-        if (available <= 0) {
-            // Ресурс кончился в реальном инвентаре — прерываем
-            if (!AutoCraftConfig.get().continueOnMissingResources) {
-                sendChat(client, "§e[AutoCraft] Нет ресурсов для крафта.");
-                finish(client, false);
-                return;
-            }
-            continue;
-        }
-
-        if (totalNeeded == 1) {
-            // Простой случай: берём весь стак, кладём в один слот,
-            // затем возвращаем остаток обратно через повторный клик
-            actionQueue.leftClick(syncId, invSlot,
-                "PLACE pick all from inv " + invSlot);
-            actionQueue.leftClick(syncId, slots.get(0),
-                "PLACE put 1 to grid " + slots.get(0));
-            // Возвращаем остаток обратно (левый клик на тот же invSlot
-            // кладёт то что на курсоре обратно)
-            actionQueue.leftClick(syncId, invSlot,
-                "PLACE return remainder to inv " + invSlot);
-
+    public void stop(boolean success) {
+        active = false;
+        if (actionQueue != null) actionQueue.clear();
+        if (success) {
+            LOGGER.info("[AutoCraft] Завершено! Создано: {} x{}", itemName, craftedCount);
+            sendChatMessage("§a[Авто крафт] Завершено! Создано: " + itemName + " x" + craftedCount);
         } else {
-            // Несколько слотов из одного источника:
-            // Берём весь стак, правым кликом по одному раскладываем
-            actionQueue.leftClick(syncId, invSlot,
-                "PLACE pick all from inv " + invSlot + " for " + totalNeeded + " slots");
-
-            for (int gridSlot : slots) {
-                // Правый клик на grid-слот кладёт ровно 1 предмет с курсора
-                actionQueue.rightClick(syncId, gridSlot,
-                    "PLACE right-click 1 to grid " + gridSlot);
-            }
-
-            // Возвращаем остаток на курсоре обратно в инвентарь
-            actionQueue.leftClick(syncId, invSlot,
-                "PLACE return cursor remainder to inv " + invSlot);
+            LOGGER.warn("[AutoCraft] Крафт остановлен досрочно. Создано: {} x{}", itemName, craftedCount);
+            sendChatMessage("§c[Авто крафт] Остановлено. Создано: " + itemName + " x" + craftedCount);
         }
     }
 
-    stallTicks = 0;
-    phase = Phase.WAIT;
-    waitTicks = 0;
+    public void tick(MinecraftClient client) {
+        if (!active || actionQueue == null) return;
+
+        boolean done = actionQueue.tick(client);
+
+        if (actionQueue.isFailed()) {
+            stop(false);
+            return;
+        }
+
+        if (done) {
+            craftedCount++;
+            sendChatMessage("§e[Авто крафт] Крафт... " + craftedCount + "/" + targetCount);
+            if (craftedCount >= targetCount) {
+                stop(true);
+            } else {
+                buildNextCraftAction();
+            }
+        }
+    }
+
+    private void buildNextCraftAction() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        actionQueue.clear();
+
+        // Открыть верстак (если настроено)
+        if (config.isAutoOpenCrafting()) {
+            actionQueue.enqueue("Открыть верстак", () -> {
+                // Если уже открыт нужный экран — успех
+                return client.currentScreen instanceof CraftingScreen;
+            });
+        }
+
+        // Разместить ингредиенты
+        actionQueue.enqueue("Разместить ингредиенты", () -> placeIngredients(client));
+
+        // Взять результат
+        actionQueue.enqueue("Взять результат", () -> takeResult(client));
+    }
+
+    private boolean placeIngredients(MinecraftClient client) {
+        if (!(client.currentScreen instanceof CraftingScreen)) return false;
+        CraftingScreen screen = (CraftingScreen) client.currentScreen;
+        CraftingScreenHandler handler = screen.getScreenHandler();
+
+        // Проверяем что слот результата не пуст (ингредиенты уже на месте или автоматически встали)
+        ItemStack result = handler.slots.get(0).getStack();
+        if (!result.isEmpty()) return true;
+
+        // Ингредиенты ещё не размещены — возвращаем false для retry
+        LOGGER.warn("[AutoCraft] Слот результата пуст, ингредиенты не размещены");
+        return false;
+    }
+
+    private boolean takeResult(MinecraftClient client) {
+        if (!(client.currentScreen instanceof CraftingScreen)) return false;
+        CraftingScreen screen = (CraftingScreen) client.currentScreen;
+        CraftingScreenHandler handler = screen.getScreenHandler();
+
+        ItemStack result = handler.slots.get(0).getStack();
+        if (result.isEmpty()) {
+            LOGGER.warn("[AutoCraft] Нечего брать из слота результата");
+            return false;
+        }
+
+        // Shift+click для быстрого перемещения в инвентарь
+        client.interactionManager.clickSlot(
+            handler.syncId, 0, 0, SlotActionType.QUICK_MOVE, client.player
+        );
+        return true;
+    }
+
+    private void onActionFail() {
+        LOGGER.error("[AutoCraft] Ошибка действия в ActionQueue — крафт остановлен");
+        stop(false);
+    }
+
+    private void sendChatMessage(String msg) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player != null) {
+            client.player.sendMessage(net.minecraft.text.Text.literal(msg), false);
+        }
+    }
+
+    public boolean isActive() { return active; }
+    public int getCraftedCount() { return craftedCount; }
+    public int getTargetCount() { return targetCount; }
+    public String getItemName() { return itemName; }
 }
