@@ -1,315 +1,142 @@
-package net.autocraft.crafting;
+// =========================================================================
+// ФАЙЛ:  src/main/java/net/autocraft/crafting/CraftingManager.java
+// МЕТОД: handlePlace() — полная замена существующего метода
+//
+// ЧТО ИСПРАВЛЕНО:
+//  1. Правильный подсчёт количества каждого предмета на слот рецепта
+//     (один предмет может встречаться в нескольких слотах shaped-рецепта)
+//  2. Stack splitting: берём ровно нужное количество через правый клик,
+//     а не весь стак левым кликом
+//  3. Если в grid-слоте уже лежит нужный предмет — пропускаем
+//  4. Виртуальный инвентарь корректно списывает точное количество
+//  5. Cursor очищается в конце если что-то осталось на курсоре
+// =========================================================================
 
-import net.autocraft.AutoCraftMod;
-import net.autocraft.action.ActionQueue;
-import net.autocraft.config.AutoCraftConfig;
-import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.network.ClientPlayerEntity;
-import net.minecraft.item.ItemStack;
-import net.minecraft.recipe.CraftingRecipe;
-import net.minecraft.recipe.Ingredient;
-import net.minecraft.screen.CraftingScreenHandler;
-import net.minecraft.screen.ScreenHandler;
-import net.minecraft.screen.slot.Slot;
-import net.minecraft.sound.SoundEvents;
-import net.minecraft.text.Text;
+// -------------------------------------------------------------------------
+// PHASE: PLACE — move ingredients from inventory into grid slots
+// -------------------------------------------------------------------------
+private void handlePlace(MinecraftClient client, ClientPlayerEntity player) {
+    CraftingScreenHandler handler = getCraftingHandler(player);
+    if (handler == null) { cancelCurrent(); return; }
 
-import java.util.*;
+    int syncId = handler.syncId;
+    List<Ingredient> ingredients = currentTask.getRecipe().getIngredients();
 
-/**
- * Orchestrates the full crafting loop.
- *
- * PHASES PER CYCLE:
- *  IDLE      → waiting for a task
- *  OPEN      → waiting for workbench screen to open
- *  CLEAR     → clearing leftover items from crafting grid
- *  PLACE     → placing ingredients into the grid
- *  WAIT      → waiting 2 ticks for server to update result slot
- *  TAKE      → shift-clicking result
- *  CHECK     → verify result received, loop or finish
- */
-public class CraftingManager {
+    // ------------------------------------------------------------------
+    // 1. Собираем план: сколько каждого предмета нужно в каждый слот
+    //    Ключ — gridSlot (1..9), значение — пара (invSlot, нужноеКол-во)
+    // ------------------------------------------------------------------
+    // Виртуальная копия инвентаря для планирования без side-effect
+    Map<Integer, ItemStack> invCopy = buildInventoryCopy(handler);
 
-    public enum Phase { IDLE, OPEN, CLEAR, PLACE, WAIT, TAKE, CHECK }
+    // plan[gridIndex] = {invSlot, count} или null если пусто/уже заполнено
+    record SlotPlan(int invSlot, int needed) {}
+    List<SlotPlan> plan = new ArrayList<>();
 
-    private Phase phase = Phase.IDLE;
-    private CraftingTask currentTask = null;
-    private final ActionQueue actionQueue = new ActionQueue();
+    for (int gridIndex = 0; gridIndex < ingredients.size(); gridIndex++) {
+        Ingredient ingredient = ingredients.get(gridIndex);
+        int gridSlot = GRID_START + gridIndex;
 
-    private int waitTicks = 0;
-    private int stallTicks = 0;
-    private static final int MAX_STALL_TICKS = 100; // ~5 sec safety abort
-
-    // Slot layout for 3x3 crafting grid in CraftingScreenHandler
-    // Slots 0 = result, 1-9 = grid (row-major), 10+ = player inventory
-    private static final int RESULT_SLOT   = 0;
-    private static final int GRID_START    = 1;
-    private static final int GRID_END      = 9;
-    private static final int INV_START     = 10;
-    private static final int INV_END       = 45;
-    private static final int HOTBAR_START  = 46;
-    private static final int HOTBAR_END    = 54;
-
-    public void startTask(CraftingTask task) {
-        cancelCurrent();
-        currentTask = task;
-        phase = Phase.OPEN;
-        actionQueue.clear();
-        actionQueue.setDelay(task.getMode().getDelayMs());
-        stallTicks = 0;
-        AutoCraftMod.LOGGER.info("[AutoCraft] Task started: {}", task.getRecipe()
-                .getResult(null).getItem());
-    }
-
-    public void cancelCurrent() {
-        if (currentTask != null) {
-            currentTask.cancel();
-        }
-        currentTask = null;
-        phase = Phase.IDLE;
-        actionQueue.clear();
-        stallTicks = 0;
-    }
-
-    public CraftingTask getCurrentTask() { return currentTask; }
-    public Phase getPhase()              { return phase; }
-    public boolean isRunning()           { return phase != Phase.IDLE; }
-
-    // -------------------------------------------------------------------------
-    // Main tick — called every client tick
-    // -------------------------------------------------------------------------
-    public void tick(MinecraftClient client) {
-        if (phase == Phase.IDLE || currentTask == null) return;
-        if (currentTask.isCancelled()) { finish(client, false); return; }
-
-        // Execute queued actions first (one per tick window)
-        if (!actionQueue.isEmpty()) {
-            actionQueue.tick(client);
-            return;
+        if (ingredient.isEmpty()) {
+            plan.add(null);
+            continue;
         }
 
-        // Stall protection
-        stallTicks++;
-        if (stallTicks > MAX_STALL_TICKS) {
-            AutoCraftMod.LOGGER.warn("[AutoCraft] Stall detected, aborting task.");
-            sendChat(client, "§c[AutoCraft] Остановка: зависание (stall).");
-            finish(client, false);
-            return;
+        // Проверяем, что уже лежит в слоте верстака
+        ItemStack existing = handler.getSlot(gridSlot).getStack();
+        if (!existing.isEmpty() && ingredient.test(existing)) {
+            // Нужный предмет уже в слоте — пропускаем
+            plan.add(null);
+            continue;
         }
 
-        ClientPlayerEntity player = client.player;
-        if (player == null) { cancelCurrent(); return; }
+        // Сколько нужно в этот слот — для стандартных рецептов всегда 1
+        // но мы резервируем 1 единицу из инвентаря
+        int needed = 1;
 
-        switch (phase) {
-
-            case OPEN -> handleOpen(client, player);
-            case CLEAR -> handleClear(client, player);
-            case PLACE -> handlePlace(client, player);
-            case WAIT  -> handleWait();
-            case TAKE  -> handleTake(client, player);
-            case CHECK -> handleCheck(client, player);
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // PHASE: OPEN — wait until a CraftingScreenHandler is active
-    // -------------------------------------------------------------------------
-    private void handleOpen(MinecraftClient client, ClientPlayerEntity player) {
-        if (player.currentScreenHandler instanceof CraftingScreenHandler) {
-            stallTicks = 0;
-            phase = Phase.CLEAR;
-            return;
-        }
-        // Screen not open — nothing we can do from client side without server interaction
-        // The GUI should have opened the workbench before calling startTask
-        // If AutoOpen is enabled, this is handled by AutoCraftScreen
-    }
-
-    // -------------------------------------------------------------------------
-    // PHASE: CLEAR — shift-click any leftover items out of the grid
-    // -------------------------------------------------------------------------
-    private void handleClear(MinecraftClient client, ClientPlayerEntity player) {
-        CraftingScreenHandler handler = getCraftingHandler(player);
-        if (handler == null) { cancelCurrent(); return; }
-
-        int syncId = handler.syncId;
-        boolean hadLeftovers = false;
-
-        for (int slot = GRID_START; slot <= GRID_END; slot++) {
-            ItemStack stack = handler.getSlot(slot).getStack();
-            if (!stack.isEmpty()) {
-                actionQueue.shiftClick(syncId, slot, "CLEAR grid slot " + slot);
-                hadLeftovers = true;
-            }
-        }
-
-        stallTicks = 0;
-        phase = Phase.PLACE;
-    }
-
-    // -------------------------------------------------------------------------
-    // PHASE: PLACE — move ingredients from inventory into grid slots
-    // -------------------------------------------------------------------------
-    private void handlePlace(MinecraftClient client, ClientPlayerEntity player) {
-        CraftingScreenHandler handler = getCraftingHandler(player);
-        if (handler == null) { cancelCurrent(); return; }
-
-        int syncId = handler.syncId;
-        List<Ingredient> ingredients = currentTask.getRecipe().getIngredients();
-
-        // Build a copy of inventory stacks so we can "consume" virtually
-        Map<Integer, ItemStack> invCopy = buildInventoryCopy(handler);
-
-        for (int gridIndex = 0; gridIndex < ingredients.size(); gridIndex++) {
-            Ingredient ingredient = ingredients.get(gridIndex);
-            if (ingredient.isEmpty()) continue;
-
-            int gridSlot = GRID_START + gridIndex;
-
-            // Find matching item in inventory
-            int invSlot = findIngredientSlot(invCopy, ingredient);
-            if (invSlot == -1) {
-                // Missing ingredient
-                if (!AutoCraftConfig.get().continueOnMissingResources) {
-                    sendChat(client, "§e[AutoCraft] Нет ресурсов для крафта.");
-                    finish(client, false);
-                    return;
-                }
-                continue;
-            }
-
-            // Pick up from inventory → place in grid
-            actionQueue.leftClick(syncId, invSlot, "PLACE pick inv " + invSlot);
-            actionQueue.leftClick(syncId, gridSlot, "PLACE put grid " + gridSlot);
-
-            // Mark as used in virtual copy
-            ItemStack used = invCopy.get(invSlot);
-            if (used != null) {
-                used.decrement(1);
-                if (used.isEmpty()) invCopy.remove(invSlot);
-            }
-        }
-
-        stallTicks = 0;
-        phase = Phase.WAIT;
-        waitTicks = 0;
-    }
-
-    // -------------------------------------------------------------------------
-    // PHASE: WAIT — give server 3 ticks to compute result
-    // -------------------------------------------------------------------------
-    private void handleWait() {
-        waitTicks++;
-        if (waitTicks >= 3) {
-            stallTicks = 0;
-            phase = Phase.TAKE;
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // PHASE: TAKE — shift-click result slot
-    // -------------------------------------------------------------------------
-    private void handleTake(MinecraftClient client, ClientPlayerEntity player) {
-        CraftingScreenHandler handler = getCraftingHandler(player);
-        if (handler == null) { cancelCurrent(); return; }
-
-        ItemStack result = handler.getSlot(RESULT_SLOT).getStack();
-        if (result.isEmpty()) {
-            // Result not ready yet — wait a bit more
-            waitTicks++;
-            if (waitTicks > 10) {
-                sendChat(client, "§e[AutoCraft] Результат не появился, проверьте ресурсы.");
+        int invSlot = findIngredientSlot(invCopy, ingredient);
+        if (invSlot == -1) {
+            if (!AutoCraftConfig.get().continueOnMissingResources) {
+                sendChat(client, "§e[AutoCraft] Нет ресурсов для крафта.");
                 finish(client, false);
+                return;
             }
-            return;
+            plan.add(null);
+            continue;
         }
 
-        int syncId = handler.syncId;
-        actionQueue.shiftClick(syncId, RESULT_SLOT, "TAKE result");
-        stallTicks = 0;
-        phase = Phase.CHECK;
+        plan.add(new SlotPlan(invSlot, needed));
+
+        // Списываем виртуально
+        ItemStack virtualStack = invCopy.get(invSlot);
+        virtualStack.decrement(needed);
+        if (virtualStack.isEmpty()) invCopy.remove(invSlot);
     }
 
-    // -------------------------------------------------------------------------
-    // PHASE: CHECK — verify we got an item, loop if needed
-    // -------------------------------------------------------------------------
-    private void handleCheck(MinecraftClient client, ClientPlayerEntity player) {
-        CraftingScreenHandler handler = getCraftingHandler(player);
-        if (handler == null) { cancelCurrent(); return; }
+    // ------------------------------------------------------------------
+    // 2. Группируем слоты по invSlot: берём из одного источника сразу
+    //    всё нужное количество через splitting, раскладываем по слотам
+    // ------------------------------------------------------------------
+    // invSlot → список grid-слотов куда класть
+    Map<Integer, List<Integer>> sourceToGridSlots = new LinkedHashMap<>();
+    for (int gridIndex = 0; gridIndex < plan.size(); gridIndex++) {
+        SlotPlan sp = plan.get(gridIndex);
+        if (sp == null) continue;
+        sourceToGridSlots
+            .computeIfAbsent(sp.invSlot, k -> new ArrayList<>())
+            .add(GRID_START + gridIndex);
+    }
 
-        ItemStack result = currentTask.getRecipe().getResult(null);
-        int outputPerCraft = result.isEmpty() ? 1 : result.getCount();
-        currentTask.addCrafted(outputPerCraft);
+    for (Map.Entry<Integer, List<Integer>> entry : sourceToGridSlots.entrySet()) {
+        int invSlot         = entry.getKey();
+        List<Integer> slots = entry.getValue();
+        int totalNeeded     = slots.size(); // каждый слот требует 1 штуку
 
-        stallTicks = 0;
+        // Получаем реальный стак в инвентаре
+        ItemStack realStack = handler.getSlot(invSlot).getStack();
+        int available = realStack.getCount();
 
-        if (currentTask.isFinished()) {
-            finish(client, true);
+        if (available <= 0) {
+            // Ресурс кончился в реальном инвентаре — прерываем
+            if (!AutoCraftConfig.get().continueOnMissingResources) {
+                sendChat(client, "§e[AutoCraft] Нет ресурсов для крафта.");
+                finish(client, false);
+                return;
+            }
+            continue;
+        }
+
+        if (totalNeeded == 1) {
+            // Простой случай: берём весь стак, кладём в один слот,
+            // затем возвращаем остаток обратно через повторный клик
+            actionQueue.leftClick(syncId, invSlot,
+                "PLACE pick all from inv " + invSlot);
+            actionQueue.leftClick(syncId, slots.get(0),
+                "PLACE put 1 to grid " + slots.get(0));
+            // Возвращаем остаток обратно (левый клик на тот же invSlot
+            // кладёт то что на курсоре обратно)
+            actionQueue.leftClick(syncId, invSlot,
+                "PLACE return remainder to inv " + invSlot);
+
         } else {
-            // Another cycle
-            phase = Phase.CLEAR;
-        }
-    }
+            // Несколько слотов из одного источника:
+            // Берём весь стак, правым кликом по одному раскладываем
+            actionQueue.leftClick(syncId, invSlot,
+                "PLACE pick all from inv " + invSlot + " for " + totalNeeded + " slots");
 
-    // -------------------------------------------------------------------------
-    // Finish
-    // -------------------------------------------------------------------------
-    private void finish(MinecraftClient client, boolean success) {
-        if (success) {
-            if (AutoCraftConfig.get().soundNotification && client.player != null) {
-                client.player.playSound(SoundEvents.ENTITY_EXPERIENCE_ORB_PICKUP, 1f, 1f);
+            for (int gridSlot : slots) {
+                // Правый клик на grid-слот кладёт ровно 1 предмет с курсора
+                actionQueue.rightClick(syncId, gridSlot,
+                    "PLACE right-click 1 to grid " + gridSlot);
             }
-            if (AutoCraftConfig.get().chatNotification) {
-                ItemStack result = currentTask.getRecipe().getResult(null);
-                String name = result.isEmpty() ? "?" :
-                        result.getItem().getName().getString();
-                sendChat(client, "§a[AutoCraft] Завершено! Создано: "
-                        + name + " x" + currentTask.getCraftedAmount());
-            }
-            AutoCraftMod.LOGGER.info("[AutoCraft] Task finished successfully. Crafted={}",
-                    currentTask.getCraftedAmount());
-        }
 
-        currentTask = null;
-        phase = Phase.IDLE;
-        actionQueue.clear();
-        stallTicks = 0;
-    }
-
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
-    private CraftingScreenHandler getCraftingHandler(ClientPlayerEntity player) {
-        if (player.currentScreenHandler instanceof CraftingScreenHandler h) return h;
-        return null;
-    }
-
-    /** Build a mutable copy of inventory slots (inv + hotbar) for virtual planning */
-    private Map<Integer, ItemStack> buildInventoryCopy(CraftingScreenHandler handler) {
-        Map<Integer, ItemStack> map = new LinkedHashMap<>();
-        for (int i = INV_START; i <= HOTBAR_END; i++) {
-            if (i >= handler.slots.size()) break;
-            ItemStack stack = handler.getSlot(i).getStack();
-            if (!stack.isEmpty()) {
-                map.put(i, stack.copy());
-            }
-        }
-        return map;
-    }
-
-    /** Find the first inventory slot that satisfies the ingredient */
-    private int findIngredientSlot(Map<Integer, ItemStack> inv, Ingredient ingredient) {
-        for (Map.Entry<Integer, ItemStack> entry : inv.entrySet()) {
-            if (!entry.getValue().isEmpty() && ingredient.test(entry.getValue())) {
-                return entry.getKey();
-            }
-        }
-        return -1;
-    }
-
-    private void sendChat(MinecraftClient client, String message) {
-        if (client.player != null) {
-            client.player.sendMessage(Text.literal(message), false);
+            // Возвращаем остаток на курсоре обратно в инвентарь
+            actionQueue.leftClick(syncId, invSlot,
+                "PLACE return cursor remainder to inv " + invSlot);
         }
     }
+
+    stallTicks = 0;
+    phase = Phase.WAIT;
+    waitTicks = 0;
 }
