@@ -1,0 +1,11 @@
+{
+  "required": true,
+  "package": "net.autocraft.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "CraftingScreenHandlerMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
