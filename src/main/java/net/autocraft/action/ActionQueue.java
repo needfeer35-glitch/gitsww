@@ -2,87 +2,158 @@ package net.autocraft.action;
 
 import net.autocraft.AutoCraftMod;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.screen.ScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.function.Consumer;
 
 /**
- * Queue of simulated player slot-click actions.
- * One action is executed per tick window when the delay has elapsed.
+ * Очередь действий с полной синхронизацией:
+ *  - каждое действие выполняется только после того, как предыдущее
+ *    подтверждено сервером (слот обновился)
+ *  - защита от десинхронизации через SlotUpdateWaiter
+ *  - задержка между действиями настраивается через setDelay()
  */
 public class ActionQueue {
 
-    public record SlotAction(
-            int syncId,
-            int slotIndex,
-            int button,
-            SlotActionType actionType,
-            String debugLabel
-    ) {}
+    // -------------------------------------------------------------------------
+    // Внутренний класс: одно действие в очереди
+    // -------------------------------------------------------------------------
+    private static class QueuedAction {
+        final Consumer<MinecraftClient> action;
+        final String debugLabel;
+        /** Слот который нужно отслеживать после выполнения (-1 = не ждать) */
+        final int watchSlot;
 
-    private final Deque<SlotAction> queue = new ArrayDeque<>();
-    private long lastActionTime = 0L;
-    private long delayMs = 150L;
-
-    public void setDelay(long ms) {
-        this.delayMs = Math.max(50L, ms);
+        QueuedAction(Consumer<MinecraftClient> action, String debugLabel, int watchSlot) {
+            this.action     = action;
+            this.debugLabel = debugLabel;
+            this.watchSlot  = watchSlot;
+        }
     }
 
+    // -------------------------------------------------------------------------
+    private final Deque<QueuedAction> queue = new ArrayDeque<>();
+    private final SlotUpdateWaiter    waiter = new SlotUpdateWaiter();
+
+    private int delayMs      = 100;
+    private long lastActionTime = 0;
+
+    // Текущее выполняемое действие (уже вызвано, ждём подтверждения)
+    private QueuedAction pending = null;
+
+    // -------------------------------------------------------------------------
+    // Публичный API — добавление действий
+    // -------------------------------------------------------------------------
+
+    /** Левый клик — отслеживаем watchSlot после выполнения */
     public void leftClick(int syncId, int slot, String label) {
-        queue.add(new SlotAction(syncId, slot, 0, SlotActionType.PICKUP, label));
+        enqueue(client -> clickSlot(client, syncId, slot, 0, SlotActionType.PICKUP),
+                label, slot);
     }
 
-    public void shiftClick(int syncId, int slot, String label) {
-        queue.add(new SlotAction(syncId, slot, 0, SlotActionType.QUICK_MOVE, label));
-    }
-
+    /** Правый клик — кладёт 1 предмет с курсора */
     public void rightClick(int syncId, int slot, String label) {
-        queue.add(new SlotAction(syncId, slot, 1, SlotActionType.PICKUP, label));
+        enqueue(client -> clickSlot(client, syncId, slot, 1, SlotActionType.PICKUP),
+                label, slot);
     }
 
-    public boolean isEmpty() { return queue.isEmpty(); }
-    public int size()        { return queue.size(); }
-    public void clear()      { queue.clear(); }
+    /** Shift+клик */
+    public void shiftClick(int syncId, int slot, String label) {
+        enqueue(client -> clickSlot(client, syncId, slot, 0, SlotActionType.QUICK_MOVE),
+                label, slot);
+    }
 
-    /**
-     * Execute the next pending action if delay has elapsed.
-     * Returns true if an action was fired.
-     */
-    public boolean tick(MinecraftClient client) {
-        if (queue.isEmpty()) return false;
+    /** Произвольное действие без отслеживания слота */
+    public void enqueue(Consumer<MinecraftClient> action, String label) {
+        queue.add(new QueuedAction(action, label, -1));
+    }
 
-        long now = System.currentTimeMillis();
-        if (now - lastActionTime < delayMs) return false;
+    /** Произвольное действие с отслеживанием конкретного слота */
+    public void enqueue(Consumer<MinecraftClient> action, String label, int watchSlot) {
+        queue.add(new QueuedAction(action, label, watchSlot));
+    }
 
-        SlotAction action = queue.poll();
-        if (action == null) return false;
+    public void setDelay(int ms) { this.delayMs = ms; }
+    public boolean isEmpty()     { return queue.isEmpty() && pending == null; }
 
-        ClientPlayerEntity player = client.player;
-        if (player == null || player.currentScreenHandler == null) {
-            queue.clear();
-            return false;
+    public void clear() {
+        queue.clear();
+        pending = null;
+        waiter.reset();
+        lastActionTime = 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Главный тик — вызывается из CraftingManager.tick() каждый тик
+    // -------------------------------------------------------------------------
+    public void tick(MinecraftClient client) {
+        if (client.player == null) return;
+
+        // --- 1. Если есть pending action — ждём подтверждения от сервера ---
+        if (pending != null) {
+            if (pending.watchSlot >= 0) {
+                // Есть слот для отслеживания
+                boolean ready = waiter.tick(client);
+                if (!ready) return; // ещё ждём
+
+                if (waiter.isTimeout()) {
+                    AutoCraftMod.LOGGER.warn("[AutoCraft] SlotWaiter TIMEOUT on slot {} ({})",
+                            pending.watchSlot, pending.debugLabel);
+                }
+            }
+            // Подтверждение получено (или таймаут) — сбрасываем pending
+            pending = null;
+            waiter.reset();
+            lastActionTime = System.currentTimeMillis(); // начинаем отсчёт задержки
+            return;
         }
 
-        // If sync ID no longer matches — screen changed, abort
-        if (player.currentScreenHandler.syncId != action.syncId()) {
-            queue.clear();
-            return false;
+        // --- 2. Задержка между действиями ---
+        if (System.currentTimeMillis() - lastActionTime < delayMs) return;
+
+        // --- 3. Берём следующее действие из очереди ---
+        if (queue.isEmpty()) return;
+
+        QueuedAction next = queue.poll();
+
+        // Снимаем snapshot слота ДО действия
+        if (next.watchSlot >= 0) {
+            ScreenHandler handler = client.player.currentScreenHandler;
+            if (handler != null) {
+                waiter.beginWatch(handler, next.watchSlot);
+            }
         }
 
-        client.interactionManager.clickSlot(
-                action.syncId(),
-                action.slotIndex(),
-                action.button(),
-                action.actionType(),
-                player
-        );
+        // Выполняем действие
+        AutoCraftMod.LOGGER.debug("[AutoCraft] Action: {}", next.debugLabel);
+        try {
+            next.action.accept(client);
+        } catch (Exception e) {
+            AutoCraftMod.LOGGER.error("[AutoCraft] Action failed: {}", next.debugLabel, e);
+            pending = null;
+            waiter.reset();
+            return;
+        }
 
-        lastActionTime = now;
-        AutoCraftMod.LOGGER.debug("[ActionQueue] {} | slot={} btn={} type={}",
-                action.debugLabel(), action.slotIndex(),
-                action.button(), action.actionType());
-        return true;
+        // Если нужно ждать подтверждения — выставляем pending
+        if (next.watchSlot >= 0) {
+            pending = next;
+        } else {
+            // Без отслеживания — просто фиксируем время
+            lastActionTime = System.currentTimeMillis();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Внутренний helper — clickSlot через interactionManager
+    // -------------------------------------------------------------------------
+    private void clickSlot(MinecraftClient client, int syncId, int slot,
+                           int button, SlotActionType type) {
+        if (client.interactionManager != null && client.player != null) {
+            client.interactionManager.clickSlot(syncId, slot, button, type, client.player);
+        }
     }
 }
