@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "autocraft",
+  "version": "${version}",
+  "name": "AutoCraft v2",
+  "description": "Quality of life auto-crafting mod via workbench",
+  "authors": ["needfeer35-glitch"],
+  "contact": {
+    "sources": "https://github.com/needfeer35-glitch/crastss"
+  },
+  "license": "MIT",
+  "icon": "assets/autocraft/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["net.autocraft.AutoCraftMod"]
+  },
+  "mixins": ["autocraft.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.16.14",
+    "fabric-api": "*",
+    "minecraft": "~1.21.5",
+    "java": ">=21"
+  }
+}
