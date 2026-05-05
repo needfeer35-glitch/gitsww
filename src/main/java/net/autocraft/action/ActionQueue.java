@@ -1,200 +1,95 @@
-package net.autocraft.action;
+package net.autocraft.crafting;
 
-import net.autocraft.AutoCraftMod;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.screen.ScreenHandler;
-import net.minecraft.screen.slot.SlotActionType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-import java.util.ArrayDeque;
-import java.util.Deque;
-import java.util.function.Consumer;
+import java.util.LinkedList;
+import java.util.Queue;
+import java.util.function.BooleanSupplier;
 
-/**
- * Очередь действий с синхронизацией + retry системой.
- *
- * RETRY ЛОГИКА:
- *  - после clickSlot ждём изменения слота (SlotUpdateWaiter)
- *  - если слот не изменился (TIMEOUT) → повторяем действие
- *  - максимум MAX_RETRIES попыток на одно действие
- *  - если все попытки исчерпаны → onFailure callback → CraftingManager останавливает крафт
- */
 public class ActionQueue {
 
+    private static final Logger LOGGER = LoggerFactory.getLogger("AutoCraft/ActionQueue");
     private static final int MAX_RETRIES = 3;
 
-    // -------------------------------------------------------------------------
-    // Внутренний класс: одно действие в очереди
-    // -------------------------------------------------------------------------
-    private static class QueuedAction {
-        final Consumer<MinecraftClient> action;
-        final String                    debugLabel;
-        final int                       watchSlot;
-        int                             attempts = 0;
+    public record Action(String name, BooleanSupplier executor) {}
 
-        QueuedAction(Consumer<MinecraftClient> action, String debugLabel, int watchSlot) {
-            this.action     = action;
-            this.debugLabel = debugLabel;
-            this.watchSlot  = watchSlot;
-        }
+    private final Queue<Action> queue = new LinkedList<>();
+    private Action currentAction = null;
+    private int retryCount = 0;
+    private int tickDelay = 0;
+    private boolean failed = false;
+
+    private final Runnable onFailCallback;
+
+    public ActionQueue(Runnable onFailCallback) {
+        this.onFailCallback = onFailCallback;
     }
 
-    // -------------------------------------------------------------------------
-    private final Deque<QueuedAction> queue  = new ArrayDeque<>();
-    private final SlotUpdateWaiter    waiter = new SlotUpdateWaiter();
-
-    private int  delayMs        = 100;
-    private long lastActionTime = 0;
-
-    private QueuedAction pending   = null;
-
-    /** Вызывается когда действие провалилось после MAX_RETRIES попыток */
-    private Runnable onFailure = null;
-
-    // -------------------------------------------------------------------------
-    // Публичный API
-    // -------------------------------------------------------------------------
-
-    public void setOnFailure(Runnable callback) { this.onFailure = callback; }
-    public void setDelay(int ms)                { this.delayMs = ms; }
-    public boolean isEmpty()                    { return queue.isEmpty() && pending == null; }
-
-    public void leftClick(int syncId, int slot, String label) {
-        enqueue(client -> clickSlot(client, syncId, slot, 0, SlotActionType.PICKUP),
-                label, slot);
-    }
-
-    public void rightClick(int syncId, int slot, String label) {
-        enqueue(client -> clickSlot(client, syncId, slot, 1, SlotActionType.PICKUP),
-                label, slot);
-    }
-
-    public void shiftClick(int syncId, int slot, String label) {
-        enqueue(client -> clickSlot(client, syncId, slot, 0, SlotActionType.QUICK_MOVE),
-                label, slot);
-    }
-
-    public void enqueue(Consumer<MinecraftClient> action, String label) {
-        queue.add(new QueuedAction(action, label, -1));
-    }
-
-    public void enqueue(Consumer<MinecraftClient> action, String label, int watchSlot) {
-        queue.add(new QueuedAction(action, label, watchSlot));
+    public void enqueue(String name, BooleanSupplier executor) {
+        queue.add(new Action(name, executor));
     }
 
     public void clear() {
         queue.clear();
-        pending        = null;
-        lastActionTime = 0;
-        waiter.reset();
+        currentAction = null;
+        retryCount = 0;
+        tickDelay = 0;
+        failed = false;
     }
 
-    // -------------------------------------------------------------------------
-    // Главный тик
-    // -------------------------------------------------------------------------
-    public void tick(MinecraftClient client) {
-        if (client.player == null) return;
-
-        // --- 1. Ожидаем подтверждения pending действия ---
-        if (pending != null) {
-            if (pending.watchSlot >= 0) {
-                boolean ready = waiter.tick(client);
-                if (!ready) return; // ещё ждём ответа сервера
-
-                if (waiter.isTimeout()) {
-                    // Сервер не ответил — пробуем retry
-                    handleRetry(client);
-                    return;
-                }
-            }
-
-            // Успех — сервер подтвердил изменение слота
-            AutoCraftMod.LOGGER.debug("[AutoCraft] Action confirmed: {} (attempt {})",
-                    pending.debugLabel, pending.attempts);
-            pending        = null;
-            waiter.reset();
-            lastActionTime = System.currentTimeMillis();
-            return;
-        }
-
-        // --- 2. Задержка между действиями ---
-        if (System.currentTimeMillis() - lastActionTime < delayMs) return;
-
-        // --- 3. Берём следующее действие ---
-        if (queue.isEmpty()) return;
-
-        executeNext(client, queue.poll());
+    public boolean isFailed() {
+        return failed;
     }
 
-    // -------------------------------------------------------------------------
-    // Retry логика
-    // -------------------------------------------------------------------------
-    private void handleRetry(MinecraftClient client) {
-        if (pending == null) return;
-
-        pending.attempts++;
-
-        if (pending.attempts >= MAX_RETRIES) {
-            // Исчерпали все попытки
-            AutoCraftMod.LOGGER.error(
-                "[AutoCraft] FAILED after {} retries: slot={} action=\"{}\"",
-                MAX_RETRIES, pending.watchSlot, pending.debugLabel
-            );
-            QueuedAction failed = pending;
-            pending = null;
-            waiter.reset();
-            queue.clear();
-
-            if (onFailure != null) {
-                onFailure.run();
-            }
-            return;
-        }
-
-        // Повторяем то же действие
-        AutoCraftMod.LOGGER.warn(
-            "[AutoCraft] Retry {}/{}: slot={} action=\"{}\"",
-            pending.attempts, MAX_RETRIES,
-            pending.watchSlot, pending.debugLabel
-        );
-
-        waiter.reset();
-        executeNext(client, pending);
+    public boolean isEmpty() {
+        return queue.isEmpty() && currentAction == null;
     }
 
-    // -------------------------------------------------------------------------
-    // Выполнить действие и настроить ожидание
-    // -------------------------------------------------------------------------
-    private void executeNext(MinecraftClient client, QueuedAction action) {
-        // Снимаем snapshot слота ДО действия
-        if (action.watchSlot >= 0) {
-            ScreenHandler handler = client.player.currentScreenHandler;
-            if (handler != null) {
-                waiter.beginWatch(handler, action.watchSlot);
-            }
+    /**
+     * Вызывать каждый тик. Возвращает true, если очередь завершена успешно.
+     */
+    public boolean tick(MinecraftClient client) {
+        if (failed) return false;
+
+        if (tickDelay > 0) {
+            tickDelay--;
+            return false;
         }
 
+        if (currentAction == null) {
+            if (queue.isEmpty()) return true; // всё выполнено
+            currentAction = queue.poll();
+            retryCount = 0;
+            LOGGER.info("[AutoCraft] Выполняю действие: {}", currentAction.name());
+        }
+
+        boolean success = false;
         try {
-            action.action.accept(client);
+            success = currentAction.executor().getAsBoolean();
         } catch (Exception e) {
-            AutoCraftMod.LOGGER.error("[AutoCraft] Action threw exception: \"{}\"",
-                    action.debugLabel, e);
-            pending = action;
-            handleRetry(client);
-            return;
+            LOGGER.error("[AutoCraft] Ошибка при выполнении действия '{}': {}", currentAction.name(), e.getMessage());
         }
 
-        if (action.watchSlot >= 0) {
-            pending = action;
+        if (success) {
+            LOGGER.info("[AutoCraft] Действие '{}' выполнено успешно", currentAction.name());
+            currentAction = null;
+            retryCount = 0;
+            tickDelay = 2; // пауза 2 тика между действиями
         } else {
-            lastActionTime = System.currentTimeMillis();
+            retryCount++;
+            LOGGER.warn("[AutoCraft] Действие '{}' не сработало. Попытка {}/{}", currentAction.name(), retryCount, MAX_RETRIES);
+            if (retryCount >= MAX_RETRIES) {
+                LOGGER.error("[AutoCraft] Действие '{}' провалилось после {} попыток. Крафт остановлен.", currentAction.name(), MAX_RETRIES);
+                failed = true;
+                clear();
+                if (onFailCallback != null) onFailCallback.run();
+                return false;
+            }
+            tickDelay = 5; // подождать 5 тиков перед retry
         }
-    }
 
-    // -------------------------------------------------------------------------
-    private void clickSlot(MinecraftClient client, int syncId, int slot,
-                           int button, SlotActionType type) {
-        if (client.interactionManager != null && client.player != null) {
-            client.interactionManager.clickSlot(syncId, slot, button, type, client.player);
-        }
+        return false;
     }
 }
