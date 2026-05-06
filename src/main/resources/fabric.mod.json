@@ -5,11 +5,7 @@
   "name": "AutoCraft v2",
   "description": "Quality of life auto-crafting mod via workbench",
   "authors": ["needfeer35-glitch"],
-  "contact": {
-    "sources": "https://github.com/needfeer35-glitch/crastss"
-  },
   "license": "MIT",
-  "icon": "assets/autocraft/icon.png",
   "environment": "client",
   "entrypoints": {
     "client": ["net.autocraft.AutoCraftMod"]
