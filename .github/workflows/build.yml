@@ -10,9 +10,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
-      - name: Checkout репозитория
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Установить Java 21
@@ -21,18 +22,20 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Настроить Gradle
-        uses: gradle/actions/setup-gradle@v3
-
-      - name: Дать права на gradlew
-        run: chmod +x ./gradlew
+      - name: Установить Gradle 8.8
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.8'
 
       - name: Собрать JAR
-        run: ./gradlew build
+        run: gradle build --no-daemon --stacktrace
 
-      - name: Загрузить JAR как артефакт
+      - name: Показать результат сборки
+        run: ls -la build/libs/
+
+      - name: Загрузить JAR
         uses: actions/upload-artifact@v4
         with:
-          name: autocraft-jar
-          path: build/libs/autocraft-*.jar
+          name: autocraft-2.0.0
+          path: build/libs/autocraft-2.0.0.jar
           if-no-files-found: error
