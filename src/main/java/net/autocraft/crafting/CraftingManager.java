@@ -8,6 +8,7 @@ import net.autocraft.recipe.GridCleaner;
 import net.autocraft.recipe.GridPlacer;
 import net.autocraft.stability.StabilityGuard;
 import net.autocraft.stability.StabilityGuard.CheckResult;
+import net.autocraft.action.ActionQueue;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.CraftingScreen;
 import net.minecraft.item.ItemStack;
