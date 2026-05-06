@@ -1,526 +1,511 @@
 package net.autocraft.gui;
 
-import net.autocraft.recipe.CraftingRecipe;
-import net.autocraft.recipe.RecipeType;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.gui.screen.Screen;
 import net.minecraft.client.gui.widget.ButtonWidget;
 import net.minecraft.client.gui.widget.TextFieldWidget;
-import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
-import net.minecraft.item.Items;
+import net.minecraft.recipe.CraftingRecipe;
+import net.minecraft.recipe.RecipeEntry;
+import net.minecraft.recipe.RecipeType;
+import net.minecraft.recipe.ShapedRecipe;
+import net.minecraft.recipe.ShapelessRecipe;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * AutoCraftScreen — главный GUI мода.
  *
- * Layout (точно по концепту):
- * ┌─────────────────────────────────────────────────┐
- * │  [Авто крафт v2]                                │
- * │ ┌──────────────┐  ┌──────────────────────────┐  │
- * │ │ 🔍 Поиск...  │  │  Выбранный предмет       │  │
- * │ │──────────────│  │  [иконка] Название        │  │
- * │ │ Дубовые доски│  │                           │  │
- * │ │ Палка        │  │  Рецепт:                  │  │
- * │ │ Факел        │  │  [3x3 grid] → [результат] │  │
- * │ │ Верстак      │  │                           │  │
- * │ │ Печь         │  │  Количество: [-][64][+][MAX]│ │
- * │ │ Сундук       │  │  Режим: [Быстрый ▼]       │  │
- * │ │ ...          │  │                           │  │
- * │ └──────────────┘  │  [    СТАРТ    ]           │  │
- * │                   └──────────────────────────┘  │
- * │ [Инвентарь игрока]                              │
- * └─────────────────────────────────────────────────┘
+ * Layout:
+ * ┌──────────────────────────────────────────────────┐
+ * │  Авто крафт v2                                   │
+ * │ ┌────────────────┐  ┌───────────────────────────┐│
+ * │ │ [🔍 Поиск...] [≡]│  Выбранный предмет         ││
+ * │ │────────────────│  │  [икона] Название           ││
+ * │ │ Дубовые доски  │  │  Рецепт:                   ││
+ * │ │ Палка          │  │  [3x3 grid] → [результат]  ││
+ * │ │ Факел          │  │                            ││
+ * │ │ Верстак        │  │  Количество: [-][64][+][MAX]││
+ * │ │ ...            │  │  Режим: [Быстрый][Средний] ││
+ * │ └────────────────┘  │  [      СТАРТ      ]        ││
+ * │                     └───────────────────────────┘│
+ * └──────────────────────────────────────────────────┘
  */
 public class AutoCraftScreen extends Screen {
 
     // ── Размеры окна ──────────────────────────────────────────────────────────
-    private static final int GUI_WIDTH  = 500;
-    private static final int GUI_HEIGHT = 240;
+    private static final int GUI_W = 500;
+    private static final int GUI_H = 240;
 
-    // Левая панель (список рецептов)
-    private static final int LIST_X     = 8;
-    private static final int LIST_Y     = 24;
-    private static final int LIST_W     = 160;
-    private static final int LIST_H     = 170;
-    private static final int ITEM_H     = 18; // высота одной строки списка
+    // Левая панель
+    private static final int LIST_X  = 8;
+    private static final int LIST_Y  = 24;
+    private static final int LIST_W  = 162;
+    private static final int LIST_H  = 198;
+    private static final int ITEM_H  = 18;
+    private static final int VISIBLE = LIST_H / ITEM_H; // кол-во видимых строк
 
-    // Правая панель (детали рецепта)
-    private static final int DETAIL_X   = 178;
-    private static final int DETAIL_Y   = 8;
-    private static final int DETAIL_W   = 314;
-    private static final int DETAIL_H   = 198;
+    // Правая панель
+    private static final int DETAIL_X = 178;
+    private static final int DETAIL_Y = 8;
+    private static final int DETAIL_W = 314;
+    private static final int DETAIL_H = 224;
 
-    // 3x3 grid preview внутри правой панели
-    private static final int GRID_X     = 197;
-    private static final int GRID_Y     = 80;
-    private static final int CELL_SIZE  = 18; // размер одной ячейки сетки
-
-    // Стрелка и результат
-    private static final int ARROW_X    = 197 + CELL_SIZE * 3 + 8;
-    private static final int RESULT_X   = ARROW_X + 20;
-    private static final int RESULT_Y   = GRID_Y + CELL_SIZE; // центр по вертикали
+    // Grid preview (3x3)
+    private static final int CELL = 18; // размер ячейки
 
     // ── Цвета ─────────────────────────────────────────────────────────────────
-    private static final int COLOR_BG           = 0xFF2B2B2B; // фон окна
-    private static final int COLOR_PANEL        = 0xFF3C3C3C; // фон панели
-    private static final int COLOR_PANEL_BORDER = 0xFF555555; // рамка панели
-    private static final int COLOR_SELECTED     = 0xFF4A7C4A; // выделенный элемент (зелёный)
-    private static final int COLOR_HOVER        = 0xFF4A4A4A; // ховер на элементе
-    private static final int COLOR_CELL         = 0xFF4A4040; // ячейка grid
-    private static final int COLOR_CELL_BORDER  = 0xFF666666;
-    private static final int COLOR_TEXT         = 0xFFFFFFFF;
-    private static final int COLOR_TEXT_GRAY    = 0xFFAAAAAA;
-    private static final int COLOR_TEXT_YELLOW  = 0xFFFFCC00;
-    private static final int COLOR_GREEN        = 0xFF4CAF50;
-    private static final int COLOR_RED          = 0xFFE53935;
+    private static final int C_BG       = 0xFF2B2B2B;
+    private static final int C_PANEL    = 0xFF3C3C3C;
+    private static final int C_BORDER   = 0xFF555555;
+    private static final int C_SELECTED = 0xFF3A6B3A;
+    private static final int C_HOVER    = 0xFF4A4A4A;
+    private static final int C_CELL     = 0xFF404040;
+    private static final int C_CELL_BR  = 0xFF666666;
+    private static final int C_WHITE    = 0xFFFFFFFF;
+    private static final int C_GRAY     = 0xFFAAAAAA;
+    private static final int C_YELLOW   = 0xFFFFCC00;
+    private static final int C_GREEN    = 0xFF4CAF50;
+    private static final int C_DARKGREEN= 0xFF2E7D32;
+
+    // ── Данные рецептов ───────────────────────────────────────────────────────
+
+    /**
+     * Одна запись в списке рецептов GUI.
+     * Хранит всё нужное для отображения и запуска крафта.
+     */
+    public static class RecipeDisplayEntry {
+        public final String displayName;      // название для списка
+        public final ItemStack icon;          // иконка (результат рецепта)
+        public final ItemStack[] grid;        // 9 слотов для 3x3 preview (null = пусто)
+        public final ItemStack result;        // результат
+        public final int resultCount;         // количество в результате
+        public final RecipeEntry<CraftingRecipe> vanillaEntry; // оригинал для CraftingManager
+
+        public RecipeDisplayEntry(RecipeEntry<CraftingRecipe> entry) {
+            this.vanillaEntry = entry;
+            CraftingRecipe recipe = entry.value();
+
+            // Результат
+            ItemStack output = recipe.getResult(MinecraftClient.getInstance()
+                    .world.getRegistryManager());
+            this.result      = output;
+            this.resultCount = output.getCount();
+            this.icon        = output.copy();
+            this.displayName = output.getName().getString();
+
+            // Строим grid 9 слотов
+            this.grid = new ItemStack[9];
+            List<net.minecraft.recipe.Ingredient> ingredients = recipe.getIngredients();
+
+            if (recipe instanceof ShapedRecipe shaped) {
+                // SHAPED — позиции важны
+                int width = shaped.getWidth();
+                for (int i = 0; i < ingredients.size(); i++) {
+                    net.minecraft.recipe.Ingredient ing = ingredients.get(i);
+                    // Получаем позицию в сетке 3x3
+                    int row = i / width;
+                    int col = i % width;
+                    int slot = row * 3 + col;
+                    if (slot < 9 && !ing.isEmpty()) {
+                        ItemStack[] matching = ing.getMatchingStacks();
+                        if (matching.length > 0) {
+                            this.grid[slot] = matching[0].copy();
+                        }
+                    }
+                }
+            } else {
+                // SHAPELESS — заполняем слева направо
+                for (int i = 0; i < Math.min(ingredients.size(), 9); i++) {
+                    net.minecraft.recipe.Ingredient ing = ingredients.get(i);
+                    if (!ing.isEmpty()) {
+                        ItemStack[] matching = ing.getMatchingStacks();
+                        if (matching.length > 0) {
+                            this.grid[i] = matching[0].copy();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // ── Состояние экрана ──────────────────────────────────────────────────────
-    private int guiLeft;
-    private int guiTop;
+    private int guiLeft, guiTop;
 
-    private final List<RecipeEntry> recipes = new ArrayList<>();
-    private int selectedIndex   = -1;   // индекс выбранного рецепта
-    private int scrollOffset    = 0;    // скролл списка
-    private int craftAmount     = 64;   // количество для крафта
-    private boolean modeFast    = true; // true=Быстрый, false=Средний
+    private final List<RecipeDisplayEntry> allRecipes      = new ArrayList<>();
+    private final List<RecipeDisplayEntry> filteredRecipes = new ArrayList<>();
 
-    private int hoveredIndex    = -1;   // строка под курсором
-    private int mouseX          = 0;
-    private int mouseY          = 0;
+    private RecipeDisplayEntry selectedRecipe = null;
+    private int selectedIndex  = -1;
+    private int scrollOffset   = 0;
+    private int craftAmount    = 64;
+    private boolean modeFast   = true;
 
-    // Поле поиска
+    // Виджеты
     private TextFieldWidget searchField;
-
-    // Кнопки
-    private ButtonWidget btnStart;
     private ButtonWidget btnMinus;
     private ButtonWidget btnPlus;
     private ButtonWidget btnMax;
     private ButtonWidget btnModeFast;
     private ButtonWidget btnModeMedium;
-
-    // ── Заглушка рецептов ─────────────────────────────────────────────────────
-    /**
-     * Одна запись в списке рецептов.
-     */
-    public record RecipeEntry(
-            String displayName,
-            ItemStack icon,
-            Item[] grid9,       // 9 элементов для 3x3 (null = пусто)
-            Item result,
-            int resultCount
-    ) {}
+    private ButtonWidget btnStart;
 
     // ── Конструктор ───────────────────────────────────────────────────────────
 
     public AutoCraftScreen() {
         super(Text.literal("Авто крафт v2"));
-        initRecipes();
     }
 
-    /**
-     * Заглушка — заполняем список стандартными рецептами Minecraft.
-     * Позже заменится на автоматический сбор из RecipeManager.
-     */
-    private void initRecipes() {
-        // Дубовые доски (заглушка grid)
-        recipes.add(new RecipeEntry(
-                "Дубовые доски",
-                new ItemStack(Items.OAK_PLANKS),
-                new Item[]{Items.OAK_LOG, null, null, null, null, null, null, null, null},
-                Items.OAK_PLANKS, 4
-        ));
-        // Палка
-        recipes.add(new RecipeEntry(
-                "Палка",
-                new ItemStack(Items.STICK),
-                new Item[]{Items.OAK_PLANKS, null, null, Items.OAK_PLANKS, null, null, null, null, null},
-                Items.STICK, 4
-        ));
-        // Факел
-        recipes.add(new RecipeEntry(
-                "Факел",
-                new ItemStack(Items.TORCH),
-                new Item[]{Items.COAL, null, null, Items.STICK, null, null, null, null, null},
-                Items.TORCH, 4
-        ));
-        // Верстак
-        recipes.add(new RecipeEntry(
-                "Верстак",
-                new ItemStack(Items.CRAFTING_TABLE),
-                new Item[]{
-                        Items.OAK_PLANKS, Items.OAK_PLANKS, null,
-                        Items.OAK_PLANKS, Items.OAK_PLANKS, null,
-                        null, null, null
-                },
-                Items.CRAFTING_TABLE, 1
-        ));
-        // Печь
-        recipes.add(new RecipeEntry(
-                "Печь",
-                new ItemStack(Items.FURNACE),
-                new Item[]{
-                        Items.COBBLESTONE, Items.COBBLESTONE, Items.COBBLESTONE,
-                        Items.COBBLESTONE, null,              Items.COBBLESTONE,
-                        Items.COBBLESTONE, Items.COBBLESTONE, Items.COBBLESTONE
-                },
-                Items.FURNACE, 1
-        ));
-        // Сундук
-        recipes.add(new RecipeEntry(
-                "Сундук",
-                new ItemStack(Items.CHEST),
-                new Item[]{
-                        Items.OAK_PLANKS, Items.OAK_PLANKS, Items.OAK_PLANKS,
-                        Items.OAK_PLANKS, null,              Items.OAK_PLANKS,
-                        Items.OAK_PLANKS, Items.OAK_PLANKS, Items.OAK_PLANKS
-                },
-                Items.CHEST, 1
-        ));
-        // Каменный меч
-        recipes.add(new RecipeEntry(
-                "Каменный меч",
-                new ItemStack(Items.STONE_SWORD),
-                new Item[]{null, Items.COBBLESTONE, null, null, Items.COBBLESTONE, null, null, Items.STICK, null},
-                Items.STONE_SWORD, 1
-        ));
-        // Каменная кирка
-        recipes.add(new RecipeEntry(
-                "Каменная кирка",
-                new ItemStack(Items.STONE_PICKAXE),
-                new Item[]{
-                        Items.COBBLESTONE, Items.COBBLESTONE, Items.COBBLESTONE,
-                        null,              Items.STICK,       null,
-                        null,              Items.STICK,       null
-                },
-                Items.STONE_PICKAXE, 1
-        ));
-        // Стрела
-        recipes.add(new RecipeEntry(
-                "Стрела",
-                new ItemStack(Items.ARROW),
-                new Item[]{null, Items.FLINT, null, null, Items.STICK, null, null, Items.FEATHER, null},
-                Items.ARROW, 4
-        ));
-    }
-
-    // ── init() — создание виджетов ────────────────────────────────────────────
+    // ── init() ────────────────────────────────────────────────────────────────
 
     @Override
     protected void init() {
-        guiLeft = (this.width  - GUI_WIDTH)  / 2;
-        guiTop  = (this.height - GUI_HEIGHT) / 2;
+        guiLeft = (this.width  - GUI_W) / 2;
+        guiTop  = (this.height - GUI_H) / 2;
+
+        // Загрузить рецепты из RecipeManager
+        loadRecipes();
 
         // ── Поле поиска ───────────────────────────────────────────────────────
         searchField = new TextFieldWidget(
-                this.textRenderer,
+                textRenderer,
                 guiLeft + LIST_X + 2,
-                guiTop  + LIST_Y - 18,
-                LIST_W - 20,
-                14,
-                Text.literal("Поиск...")
+                guiTop  + LIST_Y - 16,
+                LIST_W - 4,
+                12,
+                Text.literal("")
         );
         searchField.setMaxLength(32);
         searchField.setPlaceholder(Text.literal("Поиск..."));
+        searchField.setChangedListener(this::onSearchChanged);
         this.addDrawableChild(searchField);
 
-        // ── Кнопка количества: минус ──────────────────────────────────────────
-        btnMinus = ButtonWidget.builder(Text.literal("−"), btn -> {
-            if (craftAmount > 1) craftAmount--;
-            updateAmountDisplay();
-        })
-        .dimensions(guiLeft + DETAIL_X - guiLeft + 2, guiTop + 158, 16, 16)
-        .build();
-        this.addDrawableChild(btnMinus);
+        // ── Кнопки количества ─────────────────────────────────────────────────
+        int rx = guiLeft + DETAIL_X + 4;
+        int ry = guiTop;
 
-        // ── Кнопка количества: плюс ───────────────────────────────────────────
-        btnPlus = ButtonWidget.builder(Text.literal("+"), btn -> {
-            craftAmount++;
-            updateAmountDisplay();
-        })
-        .dimensions(guiLeft + DETAIL_X - guiLeft + 42, guiTop + 158, 16, 16)
-        .build();
-        this.addDrawableChild(btnPlus);
+        btnMinus = ButtonWidget.builder(Text.literal("−"), b -> {
+            craftAmount = Math.max(1, craftAmount - 1);
+        }).dimensions(rx, ry + 154, 16, 16).build();
 
-        // ── Кнопка MAX ────────────────────────────────────────────────────────
-        btnMax = ButtonWidget.builder(Text.literal("MAX"), btn -> {
-            craftAmount = 64;
-            updateAmountDisplay();
-        })
-        .dimensions(guiLeft + DETAIL_X - guiLeft + 62, guiTop + 158, 30, 16)
-        .build();
-        this.addDrawableChild(btnMax);
+        btnPlus = ButtonWidget.builder(Text.literal("+"), b -> {
+            craftAmount = Math.min(9999, craftAmount + 1);
+        }).dimensions(rx + 36, ry + 154, 16, 16).build();
 
-        // ── Кнопки режима: Быстрый / Средний ─────────────────────────────────
-        int modeY = guiTop + 180;
-        int modeX = guiLeft + DETAIL_X - guiLeft + 2;
+        btnMax = ButtonWidget.builder(Text.literal("MAX"), b -> {
+            craftAmount = calcMax();
+        }).dimensions(rx + 56, ry + 154, 34, 16).build();
 
-        btnModeFast = ButtonWidget.builder(Text.literal("Быстрый"), btn -> {
+        // ── Кнопки режима ─────────────────────────────────────────────────────
+        btnModeFast = ButtonWidget.builder(Text.literal("Быстрый"), b -> {
             modeFast = true;
-            updateModeButtons();
-        })
-        .dimensions(modeX, modeY, 60, 16)
-        .build();
-        this.addDrawableChild(btnModeFast);
+            refreshModeButtons();
+        }).dimensions(rx, ry + 176, 68, 16).build();
 
-        btnModeMedium = ButtonWidget.builder(Text.literal("Средний"), btn -> {
+        btnModeMedium = ButtonWidget.builder(Text.literal("Средний"), b -> {
             modeFast = false;
-            updateModeButtons();
-        })
-        .dimensions(modeX + 64, modeY, 60, 16)
-        .build();
-        this.addDrawableChild(btnModeMedium);
+            refreshModeButtons();
+        }).dimensions(rx + 72, ry + 176, 68, 16).build();
 
         // ── Кнопка СТАРТ ──────────────────────────────────────────────────────
-        btnStart = ButtonWidget.builder(Text.literal("Старт"), btn -> onStartClick())
-                .dimensions(guiLeft + DETAIL_X - guiLeft + 2, guiTop + 200, 120, 20)
-                .build();
+        btnStart = ButtonWidget.builder(Text.literal("Старт"), b -> onStart())
+                .dimensions(rx, ry + 198, 144, 20).build();
+
+        this.addDrawableChild(btnMinus);
+        this.addDrawableChild(btnPlus);
+        this.addDrawableChild(btnMax);
+        this.addDrawableChild(btnModeFast);
+        this.addDrawableChild(btnModeMedium);
         this.addDrawableChild(btnStart);
 
-        updateModeButtons();
-        recalcButtonPositions();
+        refreshModeButtons();
+        updateStartButton();
     }
 
-    // ── Пересчёт позиций кнопок относительно guiLeft/guiTop ──────────────────
+    // ── Загрузка рецептов из RecipeManager ───────────────────────────────────
 
-    private void recalcButtonPositions() {
-        int rx = guiLeft + DETAIL_X + 4;
+    private void loadRecipes() {
+        allRecipes.clear();
+        filteredRecipes.clear();
 
-        btnMinus.setX(rx);
-        btnMinus.setY(guiTop + 160);
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.world == null) return;
 
-        btnPlus.setX(rx + 36);
-        btnPlus.setY(guiTop + 160);
+        // Получаем все рецепты типа CRAFTING (верстак)
+        client.world.getRecipeManager()
+                .listAllOfType(RecipeType.CRAFTING)
+                .stream()
+                // Фильтруем только shaped и shapeless — пропускаем специальные
+                .filter(e -> e.value() instanceof ShapedRecipe
+                          || e.value() instanceof ShapelessRecipe)
+                // Сортируем по алфавиту
+                .sorted((a, b) -> {
+                    String na = a.value().getResult(client.world.getRegistryManager())
+                            .getName().getString();
+                    String nb = b.value().getResult(client.world.getRegistryManager())
+                            .getName().getString();
+                    return na.compareToIgnoreCase(nb);
+                })
+                .forEach(e -> {
+                    try {
+                        allRecipes.add(new RecipeDisplayEntry(e));
+                    } catch (Exception ex) {
+                        // Пропускаем битые/нестандартные рецепты без краша
+                        net.autocraft.AutoCraftMod.LOGGER.debug(
+                                "[AutoCraft] Пропущен рецепт {}: {}",
+                                e.id(), ex.getMessage());
+                    }
+                });
 
-        btnMax.setX(rx + 56);
-        btnMax.setY(guiTop + 160);
+        filteredRecipes.addAll(allRecipes);
 
-        btnModeFast.setX(rx);
-        btnModeFast.setY(guiTop + 182);
+        net.autocraft.AutoCraftMod.LOGGER.info(
+                "[AutoCraft] Загружено рецептов: {}", allRecipes.size());
+    }
 
-        btnModeMedium.setX(rx + 64);
-        btnModeMedium.setY(guiTop + 182);
+    // ── Поиск ────────────────────────────────────────────────────────────────
 
-        btnStart.setX(rx);
-        btnStart.setY(guiTop + 202);
-        btnStart.setWidth(120);
+    private void onSearchChanged(String query) {
+        filteredRecipes.clear();
+        scrollOffset  = 0;
+        selectedIndex = -1;
+        selectedRecipe = null;
 
-        searchField.setX(guiLeft + LIST_X + 2);
-        searchField.setY(guiTop + LIST_Y - 16);
+        String q = query.toLowerCase(Locale.ROOT).trim();
+
+        if (q.isEmpty()) {
+            filteredRecipes.addAll(allRecipes);
+        } else {
+            for (RecipeDisplayEntry e : allRecipes) {
+                if (e.displayName.toLowerCase(Locale.ROOT).contains(q)) {
+                    filteredRecipes.add(e);
+                }
+            }
+        }
+
+        updateStartButton();
     }
 
     // ── render() ──────────────────────────────────────────────────────────────
 
     @Override
     public void render(DrawContext ctx, int mx, int my, float delta) {
-        // Затемнение фона
-        this.renderBackground(ctx, mx, my, delta);
+        renderBackground(ctx, mx, my, delta);
 
-        mouseX = mx;
-        mouseY = my;
-
-        // ── Фон всего окна ────────────────────────────────────────────────────
-        ctx.fill(guiLeft, guiTop, guiLeft + GUI_WIDTH, guiTop + GUI_HEIGHT, COLOR_BG);
-        drawBorder(ctx, guiLeft, guiTop, GUI_WIDTH, GUI_HEIGHT, COLOR_PANEL_BORDER);
+        // Фон окна
+        ctx.fill(guiLeft, guiTop, guiLeft + GUI_W, guiTop + GUI_H, C_BG);
+        border(ctx, guiLeft, guiTop, GUI_W, GUI_H, C_BORDER);
 
         // Заголовок
-        ctx.drawText(textRenderer,
-                Text.literal("Авто крафт v2"),
-                guiLeft + 8, guiTop + 8,
-                COLOR_TEXT_YELLOW, false);
+        ctx.drawText(textRenderer, Text.literal("Авто крафт v2"),
+                guiLeft + 8, guiTop + 8, C_YELLOW, true);
 
-        // ── Левая панель: список рецептов ─────────────────────────────────────
         drawLeftPanel(ctx, mx, my);
-
-        // ── Правая панель: детали выбранного рецепта ──────────────────────────
         drawRightPanel(ctx, mx, my);
 
-        // Кнопки и поле поиска поверх
+        // Виджеты поверх
         super.render(ctx, mx, my, delta);
+
+        // Подсказки при наведении
+        drawTooltips(ctx, mx, my);
     }
 
-    // ── Левая панель ──────────────────────────────────────────────────────────
+    // ── Левая панель: список рецептов ─────────────────────────────────────────
 
     private void drawLeftPanel(DrawContext ctx, int mx, int my) {
         int px = guiLeft + LIST_X;
         int py = guiTop  + LIST_Y;
 
-        // Фон панели
-        ctx.fill(px, py - 18, px + LIST_W, py + LIST_H, COLOR_PANEL);
-        drawBorder(ctx, px, py - 18, LIST_W, LIST_H + 18, COLOR_PANEL_BORDER);
+        // Фон панели (включая поисковую строку)
+        ctx.fill(px, py - 18, px + LIST_W, py + LIST_H, C_PANEL);
+        border(ctx, px, py - 18, LIST_W, LIST_H + 18, C_BORDER);
 
-        // Иконка поиска
-        ctx.drawText(textRenderer, Text.literal("🔍"),
-                px + LIST_W - 16, py - 14, COLOR_TEXT_GRAY, false);
+        // Разделитель под поиском
+        ctx.fill(px + 1, py - 2, px + LIST_W - 1, py - 1, C_BORDER);
 
-        // Список рецептов (с учётом поиска и скролла)
-        String query = searchField != null ? searchField.getText().toLowerCase() : "";
+        // Список
+        for (int i = 0; i < VISIBLE; i++) {
+            int dataIdx = i + scrollOffset;
+            if (dataIdx >= filteredRecipes.size()) break;
 
-        int visibleCount = LIST_H / ITEM_H;
-        int drawY = py;
-        int drawnIndex = 0;
+            RecipeDisplayEntry entry = filteredRecipes.get(dataIdx);
+            int rowX = px + 1;
+            int rowY = py + i * ITEM_H;
 
-        for (int i = 0; i < recipes.size(); i++) {
-            RecipeEntry entry = recipes.get(i);
-
-            // Фильтрация по поиску
-            if (!query.isEmpty() && !entry.displayName().toLowerCase().contains(query)) continue;
-
-            // Скролл
-            if (drawnIndex < scrollOffset) { drawnIndex++; continue; }
-            if (drawY + ITEM_H > py + LIST_H) break;
-
-            boolean isSelected = (i == selectedIndex);
-            boolean isHovered  = mx >= px && mx < px + LIST_W
-                    && my >= drawY && my < drawY + ITEM_H;
+            boolean isSel   = (dataIdx == selectedIndex);
+            boolean isHover = mx >= rowX && mx < px + LIST_W - 1
+                           && my >= rowY && my < rowY + ITEM_H;
 
             // Фон строки
-            if (isSelected) {
-                ctx.fill(px + 1, drawY, px + LIST_W - 1, drawY + ITEM_H, COLOR_SELECTED);
-            } else if (isHovered) {
-                ctx.fill(px + 1, drawY, px + LIST_W - 1, drawY + ITEM_H, COLOR_HOVER);
+            if (isSel) {
+                ctx.fill(rowX, rowY, px + LIST_W - 1, rowY + ITEM_H, C_SELECTED);
+            } else if (isHover) {
+                ctx.fill(rowX, rowY, px + LIST_W - 1, rowY + ITEM_H, C_HOVER);
             }
 
             // Иконка предмета
-            ctx.drawItem(entry.icon(), px + 2, drawY + 1);
+            ctx.drawItem(entry.icon, rowX + 1, rowY + 1);
 
-            // Название
-            ctx.drawText(textRenderer,
-                    Text.literal(entry.displayName()),
-                    px + 20, drawY + 5,
-                    isSelected ? COLOR_TEXT_YELLOW : COLOR_TEXT,
-                    false);
+            // Название (обрезаем если не влезает)
+            String name = entry.displayName;
+            int maxW    = LIST_W - 24;
+            if (textRenderer.getWidth(name) > maxW) {
+                name = textRenderer.trimToWidth(name, maxW - 8) + "...";
+            }
 
-            drawY += ITEM_H;
-            drawnIndex++;
+            ctx.drawText(textRenderer, Text.literal(name),
+                    rowX + 19, rowY + 5,
+                    isSel ? C_YELLOW : C_WHITE, false);
         }
+
+        // Скроллбар (если рецептов больше чем видно)
+        drawScrollbar(ctx, px + LIST_W - 5, py, 4, LIST_H);
     }
 
-    // ── Правая панель ─────────────────────────────────────────────────────────
+    // ── Скроллбар ─────────────────────────────────────────────────────────────
+
+    private void drawScrollbar(DrawContext ctx, int x, int y, int w, int h) {
+        if (filteredRecipes.size() <= VISIBLE) return;
+
+        // Фон
+        ctx.fill(x, y, x + w, y + h, 0xFF222222);
+
+        // Ползунок
+        float ratio     = (float) VISIBLE / filteredRecipes.size();
+        int   thumbH    = Math.max(10, (int)(h * ratio));
+        float scrollRatio = filteredRecipes.size() > VISIBLE
+                ? (float) scrollOffset / (filteredRecipes.size() - VISIBLE) : 0;
+        int   thumbY    = y + (int)((h - thumbH) * scrollRatio);
+
+        ctx.fill(x + 1, thumbY, x + w - 1, thumbY + thumbH, 0xFF888888);
+    }
+
+    // ── Правая панель: детали рецепта ─────────────────────────────────────────
 
     private void drawRightPanel(DrawContext ctx, int mx, int my) {
         int px = guiLeft + DETAIL_X;
         int py = guiTop  + DETAIL_Y;
 
-        // Фон панели
-        ctx.fill(px, py, px + DETAIL_W, py + DETAIL_H, COLOR_PANEL);
-        drawBorder(ctx, px, py, DETAIL_W, DETAIL_H, COLOR_PANEL_BORDER);
+        ctx.fill(px, py, px + DETAIL_W, py + DETAIL_H, C_PANEL);
+        border(ctx, px, py, DETAIL_W, DETAIL_H, C_BORDER);
 
-        ctx.drawText(textRenderer,
-                Text.literal("Выбранный предмет"),
-                px + 4, py + 4, COLOR_TEXT_GRAY, false);
+        ctx.drawText(textRenderer, Text.literal("Выбранный предмет"),
+                px + 4, py + 4, C_GRAY, false);
 
-        if (selectedIndex < 0 || selectedIndex >= recipes.size()) {
-            // Ничего не выбрано
+        if (selectedRecipe == null) {
+            // Подсказка если ничего не выбрано
             ctx.drawCenteredTextWithShadow(textRenderer,
-                    Text.literal("Выберите предмет из списка"),
-                    px + DETAIL_W / 2, py + DETAIL_H / 2,
-                    COLOR_TEXT_GRAY);
+                    Text.literal("← Выберите предмет из списка"),
+                    px + DETAIL_W / 2, py + DETAIL_H / 2 - 4, C_GRAY);
             return;
         }
 
-        RecipeEntry entry = recipes.get(selectedIndex);
-
-        // Иконка и название выбранного предмета
-        ctx.drawItem(entry.icon(), px + 4, py + 14);
+        // Иконка + название выбранного предмета
+        ctx.drawItem(selectedRecipe.icon, px + 4, py + 14);
+        ctx.drawItemInSlot(textRenderer, selectedRecipe.icon, px + 4, py + 14);
         ctx.drawText(textRenderer,
-                Text.literal(entry.displayName()),
-                px + 24, py + 18,
-                COLOR_TEXT_YELLOW, false);
+                Text.literal(selectedRecipe.displayName),
+                px + 22, py + 18, C_YELLOW, true);
 
         // Подпись "Рецепт"
-        ctx.drawText(textRenderer,
-                Text.literal("Рецепт"),
-                px + 4, py + 36, COLOR_TEXT_GRAY, false);
+        ctx.drawText(textRenderer, Text.literal("Рецепт"),
+                px + 4, py + 34, C_GRAY, false);
 
-        // ── 3x3 grid preview ──────────────────────────────────────────────────
+        // ── 3x3 Grid preview ──────────────────────────────────────────────────
         int gx = px + 4;
-        int gy = py + 46;
+        int gy = py + 44;
 
         for (int row = 0; row < 3; row++) {
             for (int col = 0; col < 3; col++) {
-                int cellX = gx + col * (CELL_SIZE + 1);
-                int cellY = gy + row * (CELL_SIZE + 1);
+                int cx = gx + col * (CELL + 1);
+                int cy = gy + row * (CELL + 1);
 
-                // Ячейка
-                ctx.fill(cellX, cellY, cellX + CELL_SIZE, cellY + CELL_SIZE, COLOR_CELL);
-                drawBorder(ctx, cellX, cellY, CELL_SIZE, CELL_SIZE, COLOR_CELL_BORDER);
+                // Фон ячейки
+                ctx.fill(cx, cy, cx + CELL, cy + CELL, C_CELL);
+                border(ctx, cx, cy, CELL, CELL, C_CELL_BR);
 
-                // Предмет в ячейке
-                int idx = row * 3 + col;
-                if (idx < entry.grid9().length && entry.grid9()[idx] != null) {
-                    ctx.drawItem(new ItemStack(entry.grid9()[idx]), cellX + 1, cellY + 1);
+                // Предмет
+                ItemStack stack = selectedRecipe.grid[row * 3 + col];
+                if (stack != null && !stack.isEmpty()) {
+                    ctx.drawItem(stack, cx + 1, cy + 1);
+                    ctx.drawItemInSlot(textRenderer, stack, cx + 1, cy + 1);
                 }
             }
         }
 
         // Стрелка →
-        int arrowX = gx + 3 * (CELL_SIZE + 1) + 6;
-        int arrowY = gy + CELL_SIZE + 1;
-        ctx.drawText(textRenderer, Text.literal("→"), arrowX, arrowY, COLOR_TEXT, false);
+        int arrowX = gx + 3 * (CELL + 1) + 4;
+        int arrowY = gy + CELL + 3;
+        ctx.drawText(textRenderer, Text.literal("➜"), arrowX, arrowY, C_WHITE, false);
 
         // Слот результата
-        int resX = arrowX + 16;
-        int resY = gy + 1;
-        ctx.fill(resX, resY, resX + CELL_SIZE + 2, resY + CELL_SIZE + 2, COLOR_CELL);
-        drawBorder(ctx, resX, resY, CELL_SIZE + 2, CELL_SIZE + 2, 0xFF888888);
-        ctx.drawItem(new ItemStack(entry.result()), resX + 2, resY + 2);
+        int resX = arrowX + 18;
+        int resY = gy + CELL / 2 - 1;
+        ctx.fill(resX, resY, resX + CELL + 4, resY + CELL + 4, C_CELL);
+        border(ctx, resX, resY, CELL + 4, CELL + 4, 0xFF888888);
+        ctx.drawItem(selectedRecipe.result, resX + 2, resY + 2);
+        ctx.drawItemInSlot(textRenderer, selectedRecipe.result, resX + 2, resY + 2);
 
-        // Количество результата
-        if (entry.resultCount() > 1) {
-            ctx.drawText(textRenderer,
-                    Text.literal("x" + entry.resultCount()),
-                    resX + CELL_SIZE - 6, resY + CELL_SIZE - 4,
-                    COLOR_TEXT_YELLOW, true);
-        }
+        // ── Количество ────────────────────────────────────────────────────────
+        ctx.drawText(textRenderer, Text.literal("Количество"),
+                px + 4, py + 148, C_GRAY, false);
 
-        // ── Количество для крафта ─────────────────────────────────────────────
-        ctx.drawText(textRenderer,
-                Text.literal("Количество"),
-                px + 4, py + 152, COLOR_TEXT_GRAY, false);
-
-        // Отображение числа между - и +
-        String amountStr = String.valueOf(craftAmount);
-        ctx.fill(px + 22, py + 159, px + 54, py + 175, COLOR_PANEL_BORDER);
+        // Число между кнопками - и +
+        int amtX = guiLeft + DETAIL_X + 4 + 18;
+        int amtY = guiTop  + 154 + 4;
+        ctx.fill(amtX, amtY - 2, amtX + 16, amtY + 10, C_CELL);
         ctx.drawCenteredTextWithShadow(textRenderer,
-                Text.literal(amountStr),
-                px + 38, py + 162,
-                COLOR_TEXT_YELLOW);
+                Text.literal(String.valueOf(craftAmount)),
+                amtX + 8, amtY, C_YELLOW);
 
         // ── Режим ─────────────────────────────────────────────────────────────
-        ctx.drawText(textRenderer,
-                Text.literal("Режим"),
-                px + 4, py + 174, COLOR_TEXT_GRAY, false);
+        ctx.drawText(textRenderer, Text.literal("Режим"),
+                px + 4, py + 172, C_GRAY, false);
+    }
+
+    // ── Подсказки при наведении ───────────────────────────────────────────────
+
+    private void drawTooltips(DrawContext ctx, int mx, int my) {
+        if (selectedRecipe == null) return;
+
+        int gx = guiLeft + DETAIL_X + 4;
+        int gy = guiTop  + DETAIL_Y + 44;
+
+        // Подсказки для ячеек grid
+        for (int row = 0; row < 3; row++) {
+            for (int col = 0; col < 3; col++) {
+                int cx = gx + col * (CELL + 1);
+                int cy = gy + row * (CELL + 1);
+                ItemStack stack = selectedRecipe.grid[row * 3 + col];
+                if (stack != null && !stack.isEmpty()
+                        && mx >= cx && mx < cx + CELL
+                        && my >= cy && my < cy + CELL) {
+                    ctx.drawItemTooltip(textRenderer, stack, mx, my);
+                }
+            }
+        }
     }
 
     // ── Mouse events ──────────────────────────────────────────────────────────
 
     @Override
     public boolean mouseClicked(double mx, double my, int button) {
-        // Клик по списку рецептов
         if (button == 0) {
-            int px = guiLeft + LIST_X;
+            int px = guiLeft + LIST_X + 1;
             int py = guiTop  + LIST_Y;
 
-            if (mx >= px && mx < px + LIST_W && my >= py && my < py + LIST_H) {
-                String query = searchField != null ? searchField.getText().toLowerCase() : "";
-                int clickedRow = ((int) my - py) / ITEM_H + scrollOffset;
-                int visibleIdx = 0;
-
-                for (int i = 0; i < recipes.size(); i++) {
-                    if (!query.isEmpty()
-                            && !recipes.get(i).displayName().toLowerCase().contains(query)) continue;
-                    if (visibleIdx == clickedRow) {
-                        selectedIndex = i;
-                        break;
-                    }
-                    visibleIdx++;
+            // Клик по списку
+            if (mx >= px && mx < px + LIST_W - 2
+                    && my >= py && my < py + LIST_H) {
+                int row = (int)(my - py) / ITEM_H;
+                int idx = row + scrollOffset;
+                if (idx >= 0 && idx < filteredRecipes.size()) {
+                    selectRecipe(idx);
                 }
                 return true;
             }
@@ -530,29 +515,44 @@ public class AutoCraftScreen extends Screen {
 
     @Override
     public boolean mouseScrolled(double mx, double my, double hx, double vy) {
-        // Скролл списка
         int px = guiLeft + LIST_X;
         int py = guiTop  + LIST_Y;
 
         if (mx >= px && mx < px + LIST_W && my >= py && my < py + LIST_H) {
-            scrollOffset = Math.max(0, scrollOffset - (int) Math.signum(vy));
+            int maxScroll = Math.max(0, filteredRecipes.size() - VISIBLE);
+            scrollOffset  = Math.max(0, Math.min(maxScroll,
+                    scrollOffset - (int) Math.signum(vy)));
             return true;
         }
-        return super.mouseScrolled(mx, hx, my, vy);
+        return super.mouseScrolled(mx, my, hx, vy);
     }
 
-    // ── Кнопки ────────────────────────────────────────────────────────────────
+    // ── Выбор рецепта ─────────────────────────────────────────────────────────
 
-    private void onStartClick() {
-        if (selectedIndex < 0 || selectedIndex >= recipes.size()) return;
+    private void selectRecipe(int index) {
+        if (index < 0 || index >= filteredRecipes.size()) return;
 
-        RecipeEntry entry = recipes.get(selectedIndex);
+        selectedIndex  = index;
+        selectedRecipe = filteredRecipes.get(index);
 
-        // Передадим в CraftingManager (подключим на следующем шаге)
-        // CraftingManager.getInstance().start(...)
+        // Сбросить количество на 1 при смене рецепта
+        craftAmount = 1;
 
+        updateStartButton();
+
+        net.autocraft.AutoCraftMod.LOGGER.debug(
+                "[AutoCraft] Выбран рецепт: {}", selectedRecipe.displayName);
+    }
+
+    // ── Кнопка СТАРТ ─────────────────────────────────────────────────────────
+
+    private void onStart() {
+        if (selectedRecipe == null) return;
+
+        // TODO: подключить CraftingManager на следующем шаге
         MinecraftClient.getInstance().player.sendMessage(
-                Text.literal("§a[Авто крафт] Старт: " + entry.displayName()
+                Text.literal("§a[Авто крафт] Старт: "
+                        + selectedRecipe.displayName
                         + " x" + craftAmount
                         + " [" + (modeFast ? "Быстрый" : "Средний") + "]"),
                 false
@@ -561,57 +561,68 @@ public class AutoCraftScreen extends Screen {
         this.close();
     }
 
-    private void updateAmountDisplay() {
-        craftAmount = Math.max(1, Math.min(craftAmount, 9999));
-    }
-
-    private void updateModeButtons() {
-        // Визуально выделяем активный режим (меняем текст кнопки)
-        if (btnModeFast != null) {
-            btnModeFast.setMessage(
-                    modeFast ? Text.literal("§a§lБыстрый") : Text.literal("Быстрый")
-            );
-        }
-        if (btnModeMedium != null) {
-            btnModeMedium.setMessage(
-                    !modeFast ? Text.literal("§a§lСредний") : Text.literal("Средний")
-            );
-        }
-    }
-
-    // ── Keyboard ──────────────────────────────────────────────────────────────
-
-    @Override
-    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-        // Закрытие по Escape
-        if (keyCode == 256) {
-            this.close();
-            return true;
-        }
-        return super.keyPressed(keyCode, scanCode, modifiers);
-    }
-
-    @Override
-    public boolean shouldPause() {
-        return false; // не ставить игру на паузу при открытии GUI
-    }
-
     // ── Вспомогательные ───────────────────────────────────────────────────────
 
-    /**
-     * Нарисовать рамку вокруг прямоугольника.
-     */
-    private void drawBorder(DrawContext ctx, int x, int y, int w, int h, int color) {
-        ctx.fill(x,         y,         x + w,     y + 1,     color); // top
-        ctx.fill(x,         y + h - 1, x + w,     y + h,     color); // bottom
-        ctx.fill(x,         y,         x + 1,     y + h,     color); // left
-        ctx.fill(x + w - 1, y,         x + w,     y + h,     color); // right
+    /** Посчитать MAX — сколько раз можно скрафтить исходя из инвентаря */
+    private int calcMax() {
+        if (selectedRecipe == null) return 1;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.player == null) return 1;
+
+        int max = Integer.MAX_VALUE;
+        for (ItemStack cell : selectedRecipe.grid) {
+            if (cell == null || cell.isEmpty()) continue;
+            int inInv = countInInventory(client, cell);
+            if (inInv == 0) return 1;
+            max = Math.min(max, inInv);
+        }
+        return max == Integer.MAX_VALUE ? 1 : max;
     }
 
-    // ── Геттеры (для других классов) ─────────────────────────────────────────
+    private int countInInventory(MinecraftClient client, ItemStack needed) {
+        int count = 0;
+        for (int i = 0; i < client.player.getInventory().size(); i++) {
+            ItemStack s = client.player.getInventory().getStack(i);
+            if (!s.isEmpty() && ItemStack.areItemsEqual(s, needed)) {
+                count += s.getCount();
+            }
+        }
+        return count;
+    }
 
-    public int getSelectedIndex()       { return selectedIndex; }
-    public int getCraftAmount()         { return craftAmount; }
-    public boolean isModeFast()         { return modeFast; }
-    public List<RecipeEntry> getRecipes() { return recipes; }
+    private void refreshModeButtons() {
+        if (btnModeFast == null || btnModeMedium == null) return;
+        btnModeFast.setMessage(
+                modeFast ? Text.literal("§a§lБыстрый") : Text.literal("Быстрый"));
+        btnModeMedium.setMessage(
+                !modeFast ? Text.literal("§a§lСредний") : Text.literal("Средний"));
+    }
+
+    private void updateStartButton() {
+        if (btnStart == null) return;
+        btnStart.active = selectedRecipe != null;
+    }
+
+    /** Нарисовать рамку 1px вокруг прямоугольника */
+    private void border(DrawContext ctx, int x, int y, int w, int h, int color) {
+        ctx.fill(x,         y,         x + w,     y + 1,     color);
+        ctx.fill(x,         y + h - 1, x + w,     y + h,     color);
+        ctx.fill(x,         y + 1,     x + 1,     y + h - 1, color);
+        ctx.fill(x + w - 1, y + 1,     x + w,     y + h - 1, color);
+    }
+
+    @Override
+    public boolean keyPressed(int key, int scan, int mods) {
+        if (key == 256) { this.close(); return true; } // Escape
+        return super.keyPressed(key, scan, mods);
+    }
+
+    @Override
+    public boolean shouldPause() { return false; }
+
+    // ── Геттеры ───────────────────────────────────────────────────────────────
+
+    public RecipeDisplayEntry getSelectedRecipe() { return selectedRecipe; }
+    public int getCraftAmount()                   { return craftAmount; }
+    public boolean isModeFast()                   { return modeFast; }
 }
