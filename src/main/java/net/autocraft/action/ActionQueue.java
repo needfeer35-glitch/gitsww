@@ -1,4 +1,4 @@
-package net.autocraft.crafting;
+package net.autocraft.action;
 
 import net.minecraft.client.MinecraftClient;
 import org.slf4j.Logger;
