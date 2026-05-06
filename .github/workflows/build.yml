@@ -10,7 +10,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -22,15 +22,15 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: Установить Gradle 8.8
+      - name: Установить Gradle 8.11
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.8'
+          gradle-version: '8.12'
 
       - name: Собрать JAR
         run: gradle build --no-daemon --stacktrace
 
-      - name: Показать результат сборки
+      - name: Показать результат
         run: ls -la build/libs/
 
       - name: Загрузить JAR
