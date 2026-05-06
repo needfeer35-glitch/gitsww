@@ -24,12 +24,18 @@ import java.util.List;
 /**
  * CraftingManager — центральный контроллер авто-крафта.
  *
- * Жизненный цикл:
- *   start() → buildNextCraftCycle() → [тики] → onActionQueueFinished()
- *           → buildNextCraftCycle() (повтор) или finishSuccess() / stop()
+ * Шаг 15: AUTO OPEN WORKBENCH
  *
- * Потокобезопасность: все вызовы происходят из главного потока Minecraft (client tick).
- * Не вызывать методы из других потоков.
+ * Новая фаза WAITING_FOR_WORKBENCH добавлена между start() и buildNextCraftCycle().
+ *
+ * Если config.openWorkbenchAuto == true:
+ *   → WorkbenchFinder.findAndOpen() ищет ближайший верстак и открывает его.
+ *   → Если верстак не найден — ждём пока игрок откроет сам (режим WAIT_FOR_PLAYER).
+ *
+ * Если config.openWorkbenchAuto == false:
+ *   → Сразу ждём пока игрок откроет верстак (режим WAIT_FOR_PLAYER).
+ *
+ * После того как CraftingScreen появился — переходим к buildNextCraftCycle() как раньше.
  */
 public class CraftingManager {
 
@@ -48,13 +54,27 @@ public class CraftingManager {
 
     // ── Внутреннее состояние ──────────────────────────────────────────────────
 
-    private boolean active        = false;  // крафт запущен
-    private boolean paused        = false;  // крафт на паузе
-    private boolean finishing     = false;  // флаг защиты от двойного вызова finish
+    /**
+     * Фаза жизненного цикла крафта.
+     *
+     * IDLE                   — ничего не происходит
+     * WAITING_FOR_WORKBENCH  — ждём пока верстак откроется (после авто-открытия или вручную)
+     * CRAFTING               — активный крафт (ActionQueue тикает)
+     * FINISHING              — защита от двойного вызова finish
+     */
+    private enum Phase {
+        IDLE,
+        WAITING_FOR_WORKBENCH,
+        CRAFTING,
+        FINISHING
+    }
 
-    private int craftedCount      = 0;      // сколько циклов уже выполнено
-    private int targetCount       = 0;      // сколько нужно выполнить
-    private String itemName       = "";     // название предмета для GUI/чата
+    private Phase   phase          = Phase.IDLE;
+    private boolean paused         = false;
+
+    private int craftedCount       = 0;
+    private int targetCount        = 0;
+    private String itemName        = "";
 
     private CraftingRecipe currentRecipe;
     private List<IngredientRequirement> requirements = List.of();
@@ -62,23 +82,24 @@ public class CraftingManager {
     private ActionQueue    actionQueue;
     private StabilityGuard stabilityGuard = new StabilityGuard();
 
+    // Тики ожидания верстака (защита от бесконечного висения)
+    private int workbenchWaitTicks = 0;
+    private static final int WORKBENCH_WAIT_TIMEOUT_TICKS = 20 * 30; // 30 секунд
+
+    // Был ли уже выполнен авто-открытие в текущей сессии ожидания
+    private boolean autoOpenAttempted = false;
+
     // ── Публичный API ─────────────────────────────────────────────────────────
 
     /**
      * Запустить новый крафт.
-     * Если крафт уже идёт — старый будет полностью остановлен.
-     *
-     * @param itemName     название предмета (только для отображения)
-     * @param amount       сколько раз выполнить крафт
-     * @param requirements список требуемых ингредиентов (для предварительной проверки)
-     * @param recipe       рецепт крафта
+     * Шаг 15: сначала входим в фазу WAITING_FOR_WORKBENCH.
      */
     public void start(String itemName,
                       int amount,
                       List<IngredientRequirement> requirements,
                       CraftingRecipe recipe) {
 
-        // Защита от некорректных аргументов
         if (amount <= 0) {
             LOGGER.warn("[AutoCraft] start() вызван с amount <= 0, игнорируем.");
             return;
@@ -88,14 +109,14 @@ public class CraftingManager {
             return;
         }
 
-        // Если предыдущий крафт ещё идёт — тихо остановим его без сообщения
-        if (active) {
+        // Если предыдущий крафт ещё идёт — тихо остановим его
+        if (phase != Phase.IDLE) {
             stopInternal(false);
         }
 
         MinecraftClient client = MinecraftClient.getInstance();
 
-        // Проверка наличия ресурсов ДО старта
+        // Проверка ресурсов ДО старта
         if (!IngredientFinder.hasEnoughForCrafts(
                 client.player.getInventory(), requirements, amount)) {
             LOGGER.warn("[AutoCraft] Недостаточно ресурсов для {} x{}", itemName, amount);
@@ -103,60 +124,50 @@ public class CraftingManager {
             return;
         }
 
-        // Инициализация состояния
-        this.itemName       = itemName != null ? itemName : "?";
-        this.targetCount    = amount;
-        this.requirements   = requirements != null ? requirements : List.of();
-        this.currentRecipe  = recipe;
-        this.craftedCount   = 0;
-        this.active         = true;
-        this.paused         = false;
-        this.finishing      = false;
+        // Инициализация
+        this.itemName              = itemName != null ? itemName : "?";
+        this.targetCount           = amount;
+        this.requirements          = requirements != null ? requirements : List.of();
+        this.currentRecipe         = recipe;
+        this.craftedCount          = 0;
+        this.paused                = false;
+        this.workbenchWaitTicks    = 0;
+        this.autoOpenAttempted     = false;
 
-        // Пересоздаём очередь и guard для чистого старта
         this.actionQueue    = new ActionQueue(this::onActionFail, this::onActionQueueFinished);
         this.stabilityGuard = new StabilityGuard();
 
         LOGGER.info("[AutoCraft] Старт крафта: {} x{}", this.itemName, targetCount);
         sendChat("§a[Авто крафт] Начало крафта: " + this.itemName + " x" + targetCount);
 
-        buildNextCraftCycle();
+        // ── ШАГ 15: Переходим в фазу ожидания верстака ────────────────────────
+        enterWaitingForWorkbench(client);
     }
 
     /**
-     * Полная остановка с уведомлением игрока.
+     * Полная остановка с уведомлением.
      */
     public void stop() {
-        if (!active) return;
+        if (phase == Phase.IDLE) return;
         stopInternal(true);
     }
 
-    /**
-     * Пауза — замораживает выполнение на текущем шаге.
-     * Безопасно вызывать в любой момент во время крафта.
-     */
     public void pause() {
-        if (!active || paused) return;
+        if (phase == Phase.IDLE || paused) return;
         paused = true;
         if (actionQueue != null) actionQueue.pause();
         LOGGER.info("[AutoCraft] Пауза.");
         sendChat("§e[Авто крафт] Пауза.");
     }
 
-    /**
-     * Возобновить после паузы.
-     */
     public void resume() {
-        if (!active || !paused) return;
+        if (phase == Phase.IDLE || !paused) return;
         paused = false;
         if (actionQueue != null) actionQueue.resume();
         LOGGER.info("[AutoCraft] Возобновлено.");
         sendChat("§a[Авто крафт] Возобновлено.");
     }
 
-    /**
-     * Переключатель паузы — удобно вешать на кнопку GUI.
-     */
     public void togglePause() {
         if (paused) resume();
         else pause();
@@ -166,58 +177,128 @@ public class CraftingManager {
 
     /**
      * Вызывается каждый клиентский тик из AutoCraftMod.
-     * Здесь происходит вся логика выполнения очереди.
+     *
+     * Диспетчер по фазам:
+     *   IDLE               → ничего
+     *   WAITING_FOR_WORKBENCH → tickWaitingForWorkbench()
+     *   CRAFTING           → tickCrafting()
+     *   FINISHING          → ничего
      */
     public void tick(MinecraftClient client) {
-        if (!active || paused || actionQueue == null) return;
-
-        // Если игрок вышел или умер — аварийная остановка
+        if (paused) return;
         if (client.player == null) {
-            LOGGER.warn("[AutoCraft] Игрок null — аварийная остановка.");
+            if (phase != Phase.IDLE) {
+                LOGGER.warn("[AutoCraft] Игрок null — аварийная остановка.");
+                stopInternal(false);
+            }
+            return;
+        }
+
+        switch (phase) {
+            case WAITING_FOR_WORKBENCH -> tickWaitingForWorkbench(client);
+            case CRAFTING              -> tickCrafting(client);
+            default                    -> {} // IDLE и FINISHING — молча
+        }
+    }
+
+    // ── Фаза WAITING_FOR_WORKBENCH ────────────────────────────────────────────
+
+    /**
+     * Шаг 15 — логика ожидания верстака.
+     *
+     * Каждый тик:
+     *   1. Если верстак уже открыт → переходим к крафту
+     *   2. Если авто-открытие включено и ещё не пробовали → пробуем открыть
+     *   3. Ждём (workbenchWaitTicks++)
+     *   4. По таймауту — останавливаемся с сообщением
+     */
+    private void tickWaitingForWorkbench(MinecraftClient client) {
+        // Верстак открыт — отлично, начинаем крафт
+        if (WorkbenchFinder.isWorkbenchOpen(client)) {
+            LOGGER.info("[AutoCraft] Верстак открыт — начинаю крафт.");
+            sendChat("§a[Авто крафт] Верстак открыт. Крафтю...");
+            phase = Phase.CRAFTING;
+            buildNextCraftCycle();
+            return;
+        }
+
+        // Авто-открытие: один раз за сессию ожидания
+        if (AutoCraftConfig.get().openWorkbenchAuto && !autoOpenAttempted) {
+            autoOpenAttempted = true;
+            LOGGER.info("[AutoCraft] Пытаюсь найти и открыть верстак...");
+            boolean found = WorkbenchFinder.findAndOpen(client);
+            if (!found) {
+                sendChat("§e[Авто крафт] Верстак не найден рядом. Открой верстак вручную.");
+            }
+            // Не выходим — ждём следующего тика когда screen появится
+            return;
+        }
+
+        // Таймаут ожидания
+        workbenchWaitTicks++;
+        if (workbenchWaitTicks >= WORKBENCH_WAIT_TIMEOUT_TICKS) {
+            LOGGER.error("[AutoCraft] Таймаут ожидания верстака ({} тиков).",
+                    WORKBENCH_WAIT_TIMEOUT_TICKS);
+            sendChat("§c[Авто крафт] Верстак не открыт за 30 сек. Крафт отменён.");
             stopInternal(false);
             return;
         }
 
-        // Тикаем очередь — колбэки onActionFail/onActionQueueFinished
-        // вызываются изнутри actionQueue.tick()
+        // Каждые 5 секунд — напоминание игроку (если авто не включено)
+        if (!AutoCraftConfig.get().openWorkbenchAuto
+                && workbenchWaitTicks % (20 * 5) == 0) {
+            sendChat("§e[Авто крафт] Жду открытия верстака... ("
+                    + (workbenchWaitTicks / 20) + "с)");
+        }
+    }
+
+    // ── Фаза CRAFTING ─────────────────────────────────────────────────────────
+
+    private void tickCrafting(MinecraftClient client) {
+        if (actionQueue == null) return;
+
+        // Если во время крафта игрок закрыл верстак — возвращаемся в ожидание
+        if (!WorkbenchFinder.isWorkbenchOpen(client)) {
+            LOGGER.warn("[AutoCraft] Верстак закрыт во время крафта — жду повторного открытия.");
+            sendChat("§e[Авто крафт] Верстак закрыт. Открой снова для продолжения.");
+            phase               = Phase.WAITING_FOR_WORKBENCH;
+            workbenchWaitTicks  = 0;
+            autoOpenAttempted   = false;
+            if (actionQueue != null) actionQueue.pause();
+            return;
+        }
+
+        // Если пауза была снята — возобновляем очередь
+        if (!paused && actionQueue.isPaused()) {
+            actionQueue.resume();
+        }
+
         actionQueue.tick(client);
     }
 
     // ── Построение цикла крафта ───────────────────────────────────────────────
 
-    /**
-     * Строит ActionQueue для одного цикла крафта (4 шага).
-     * Вызывается при старте и после каждого успешного цикла.
-     */
     private void buildNextCraftCycle() {
-        // Сбрасываем очередь (на случай если осталось что-то от предыдущего цикла)
         actionQueue.clear();
 
-        // ── Шаг 1: Проверить и очистить grid ─────────────────────────────────
-        // Если grid загрязнена с прошлого раза — вернуть предметы в инвентарь.
-        // Confirmation: grid пуста → можно продолжать.
+        // Шаг 1: Проверить и очистить grid
         actionQueue.enqueue(
                 "Проверка/очистка grid",
                 () -> {
                     MinecraftClient mc = MinecraftClient.getInstance();
-                    // isStateClean проверяет и слот результата, и саму сетку
                     if (stabilityGuard.isStateClean(mc)) return true;
                     LOGGER.warn("[AutoCraft] Grid не чистая перед крафтом — очищаю");
                     return GridCleaner.clearGrid(mc);
                 },
                 () -> GridCleaner.isGridEmpty(MinecraftClient.getInstance()),
-                2  // 2 тика задержки перед выполнением
+                2
         );
 
-        // ── Шаг 2: Сохранить снапшот инвентаря ───────────────────────────────
-        // Запомнить количество целевого предмета ДО того как взять результат.
-        // Нужно StabilityGuard для проверки после крафта.
-        // Confirmation не нужно — это чисто локальная операция.
+        // Шаг 2: Снапшот инвентаря
         actionQueue.enqueue(
                 "Снапшот инвентаря",
                 () -> {
                     MinecraftClient mc = MinecraftClient.getInstance();
-                    // Проверяем что игрок всё ещё у верстака
                     if (!(mc.currentScreen instanceof CraftingScreen)) {
                         LOGGER.warn("[AutoCraft] Верстак закрыт перед снапшотом");
                         return false;
@@ -225,22 +306,18 @@ public class CraftingManager {
                     stabilityGuard.snapshotBefore(mc, currentRecipe.getResult());
                     return true;
                 },
-                1  // минимальная задержка
+                1
         );
 
-        // ── Шаг 3: Разместить ингредиенты в сетке ────────────────────────────
-        // GridPlacer перекладывает предметы из инвентаря в grid клик за кликом.
-        // Confirmation: слот 0 (результат) стал непустым — сервер рассчитал рецепт.
+        // Шаг 3: Разместить ингредиенты
         actionQueue.enqueue(
                 "Разместить ингредиенты",
                 () -> GridPlacer.place(MinecraftClient.getInstance(), currentRecipe),
                 () -> resultReady(MinecraftClient.getInstance()),
-                3  // 3 тика — дать серверу время на обработку предыдущего шага
+                3
         );
 
-        // ── Шаг 4: Взять результат ────────────────────────────────────────────
-        // Shift-click по слоту 0 → предмет уходит в инвентарь.
-        // Confirmation: слот 0 стал пустым — предмет действительно ушёл.
+        // Шаг 4: Взять результат
         actionQueue.enqueue(
                 "Взять результат",
                 () -> takeResult(MinecraftClient.getInstance()),
@@ -251,174 +328,128 @@ public class CraftingManager {
 
     // ── Колбэки ActionQueue ───────────────────────────────────────────────────
 
-    /**
-     * Вызывается ActionQueue когда ВСЕ 4 шага одного цикла выполнены.
-     * Здесь проверяем результат через StabilityGuard и решаем — продолжать или нет.
-     */
     private void onActionQueueFinished() {
-        // Защита от повторного вызова (например если колбэк сработал дважды)
-        if (!active || finishing) return;
+        if (phase == Phase.FINISHING || phase == Phase.IDLE) return;
 
-        MinecraftClient client = MinecraftClient.getInstance();
-
-        // StabilityGuard сравнивает инвентарь ДО и ПОСЛЕ
+        MinecraftClient mc = MinecraftClient.getInstance();
         CheckResult check = stabilityGuard.verifyAfter(
-                client,
+                mc,
                 currentRecipe.getResult(),
                 currentRecipe.getResultCount()
         );
 
         switch (check) {
-
             case OK -> {
                 craftedCount++;
-                LOGGER.info("[AutoCraft] ✓ Цикл {}/{} завершён", craftedCount, targetCount);
-                sendChat("§e[Авто крафт] Крафт... " + craftedCount + "/" + targetCount);
+                LOGGER.info("[AutoCraft] Цикл {} / {} завершён.", craftedCount, targetCount);
 
                 if (craftedCount >= targetCount) {
-                    // Достигли нужного количества
                     finishSuccess();
                 } else {
-                    // Нужно ещё — проверяем ресурсы на следующий цикл
-                    int remaining = targetCount - craftedCount;
-                    if (!IngredientFinder.hasEnoughForCrafts(
-                            client.player.getInventory(), requirements, remaining)) {
-                        LOGGER.warn("[AutoCraft] Ресурсы закончились на {}/{}", craftedCount, targetCount);
-                        sendChat("§c[Авто крафт] Ресурсы закончились! Создано: "
-                                + craftedCount + "/" + targetCount);
-                        stopInternal(false); // не выводим повторное сообщение об остановке
-                        return;
-                    }
-                    // Запускаем следующий цикл
                     buildNextCraftCycle();
                 }
             }
-
             case ROLLBACK -> {
-                // Рассинхронизация — StabilityGuard уже очистил grid
-                // Повторяем тот же цикл заново
-                LOGGER.warn("[AutoCraft] Откат #{} — повтор цикла",
-                        stabilityGuard.getRollbackCount());
-                sendChat("§e[Авто крафт] Повтор крафта...");
+                LOGGER.warn("[AutoCraft] Откат #{} — повтор цикла.", stabilityGuard.getRollbackCount());
                 buildNextCraftCycle();
             }
-
             case FATAL -> {
-                // Слишком много откатов подряд — что-то серьёзно не так
-                LOGGER.error("[AutoCraft] Фатальная ошибка стабильности — остановка");
-                sendChat("§c[Авто крафт] Ошибка стабильности! Крафт остановлен.");
+                LOGGER.error("[AutoCraft] Фатальная ошибка StabilityGuard — остановка.");
+                sendChat("§c[Авто крафт] Критическая ошибка. Крафт остановлен.");
                 stopInternal(false);
             }
         }
     }
 
-    /**
-     * Вызывается ActionQueue когда действие провалилось после MAX_RETRIES попыток.
-     * Это аварийная ситуация — пытаемся очистить grid и останавливаемся.
-     */
     private void onActionFail() {
-        if (!active) return;
-        LOGGER.error("[AutoCraft] Действие провалилось после всех попыток — аварийная остановка");
+        LOGGER.error("[AutoCraft] Действие провалилось — аварийная остановка");
         sendChat("§c[Авто крафт] Ошибка! Крафт остановлен.");
 
-        // Пробуем вернуть предметы из grid в инвентарь
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.currentScreen instanceof CraftingScreen) {
             GridCleaner.clearGrid(mc);
         }
 
-        stopInternal(false); // сообщение уже отправили выше
+        stopInternal(false);
     }
 
     // ── Действия над верстаком ────────────────────────────────────────────────
 
-    /**
-     * Shift-click по слоту результата (слот 0).
-     * Переносит готовый предмет в инвентарь игрока.
-     */
     private boolean takeResult(MinecraftClient client) {
         if (!(client.currentScreen instanceof CraftingScreen screen)) {
             LOGGER.warn("[AutoCraft] takeResult: верстак не открыт");
             return false;
         }
-
         CraftingScreenHandler handler = screen.getScreenHandler();
         ItemStack result = handler.slots.get(0).getStack();
-
         if (result.isEmpty()) {
             LOGGER.warn("[AutoCraft] takeResult: слот результата пуст");
             return false;
         }
-
         client.interactionManager.clickSlot(
-                handler.syncId,
-                0,
-                0,
-                SlotActionType.QUICK_MOVE,
-                client.player
-        );
-
+                handler.syncId, 0, 0, SlotActionType.QUICK_MOVE, client.player);
         LOGGER.debug("[AutoCraft] takeResult: взят {}", result.getItem());
         return true;
     }
 
-    /**
-     * Проверка подтверждения для takeResult:
-     * слот 0 стал пустым → предмет успешно ушёл в инвентарь.
-     */
     private boolean resultTaken(MinecraftClient client) {
-        if (!(client.currentScreen instanceof CraftingScreen screen)) {
-            // Экран закрылся — считаем что предмет взят (возможно игрок закрыл сам)
-            return true;
-        }
+        if (!(client.currentScreen instanceof CraftingScreen screen)) return true;
         return screen.getScreenHandler().slots.get(0).getStack().isEmpty();
     }
 
-    /**
-     * Проверка: результат появился в слоте 0 после размещения ингредиентов.
-     * Используется как confirmation для шага "Разместить ингредиенты".
-     */
     private boolean resultReady(MinecraftClient client) {
         if (!(client.currentScreen instanceof CraftingScreen screen)) return false;
         return !screen.getScreenHandler().slots.get(0).getStack().isEmpty();
     }
 
-    // ── Внутренняя остановка ──────────────────────────────────────────────────
+    // ── Старт/стоп ────────────────────────────────────────────────────────────
 
     /**
-     * Внутренняя остановка. Если notify=true — отправит сообщение игроку.
-     * Используется как для штатной, так и для аварийной остановки.
+     * Инициализировать фазу ожидания верстака.
+     * Шаг 15: единая точка входа после start().
      */
-    private void stopInternal(boolean notify) {
-        if (finishing) return; // предотвращаем двойной вызов
-        finishing = true;
-        active    = false;
-        paused    = false;
+    private void enterWaitingForWorkbench(MinecraftClient client) {
+        workbenchWaitTicks = 0;
+        autoOpenAttempted  = false;
+        phase              = Phase.WAITING_FOR_WORKBENCH;
 
-        if (actionQueue != null) {
-            actionQueue.clear();
+        // Если верстак уже открыт — незачем ждать, сразу крафтим
+        if (WorkbenchFinder.isWorkbenchOpen(client)) {
+            LOGGER.info("[AutoCraft] Верстак уже открыт — сразу к крафту.");
+            phase = Phase.CRAFTING;
+            buildNextCraftCycle();
+            return;
         }
+
+        if (AutoCraftConfig.get().openWorkbenchAuto) {
+            sendChat("§e[Авто крафт] Ищу верстак рядом...");
+        } else {
+            sendChat("§e[Авто крафт] Открой верстак для начала крафта.");
+        }
+    }
+
+    private void stopInternal(boolean notify) {
+        if (phase == Phase.FINISHING) return;
+        phase  = Phase.FINISHING;
+        paused = false;
+
+        if (actionQueue != null) actionQueue.clear();
 
         if (notify) {
             LOGGER.info("[AutoCraft] Крафт остановлен. Создано: {} x{}", itemName, craftedCount);
             sendChat("§c[Авто крафт] Остановлено. Создано: " + itemName + " x" + craftedCount);
         }
 
-        finishing = false;
+        phase = Phase.IDLE;
     }
 
-    /**
-     * Успешное завершение всего задания.
-     */
     private void finishSuccess() {
-        if (finishing) return;
-        finishing = true;
-        active    = false;
-        paused    = false;
+        if (phase == Phase.FINISHING) return;
+        phase  = Phase.FINISHING;
+        paused = false;
 
         if (actionQueue != null) actionQueue.clear();
 
-        // Звуковое уведомление (если включено в конфиге)
         if (AutoCraftConfig.get().soundNotification) {
             MinecraftClient mc = MinecraftClient.getInstance();
             if (mc.player != null) {
@@ -429,36 +460,39 @@ public class CraftingManager {
         LOGGER.info("[AutoCraft] ✓ Завершено! Создано: {} x{}", itemName, craftedCount);
         sendChat("§a[Авто крафт] Завершено! Создано: " + itemName + " x" + craftedCount);
 
-        finishing = false;
+        phase = Phase.IDLE;
     }
 
     // ── Геттеры для GUI ───────────────────────────────────────────────────────
 
-    /** Крафт активен (запущен и не остановлен) */
-    public boolean isActive()           { return active; }
+    /** Крафт активен (не IDLE) */
+    public boolean isActive()           { return phase != Phase.IDLE; }
 
-    /** Крафт на паузе */
+    /** Ждёт открытия верстака */
+    public boolean isWaitingForWorkbench() { return phase == Phase.WAITING_FOR_WORKBENCH; }
+
     public boolean isPaused()           { return paused; }
-
-    /** Сколько циклов уже выполнено */
     public int getCraftedCount()        { return craftedCount; }
-
-    /** Сколько циклов нужно выполнить всего */
     public int getTargetCount()         { return targetCount; }
-
-    /** Название предмета (для GUI) */
     public String getItemName()         { return itemName; }
-
-    /** Количество откатов (для отладки в GUI) */
     public int getRollbackCount()       { return stabilityGuard.getRollbackCount(); }
-
-    /** Прямой доступ к очереди (для GUI — pause/resume кнопки) */
     public ActionQueue getActionQueue() { return actionQueue; }
 
-    /** Прогресс 0.0 – 1.0 (для прогресс-бара в GUI) */
     public float getProgress() {
         if (targetCount <= 0) return 0f;
         return Math.min(1f, (float) craftedCount / targetCount);
+    }
+
+    /**
+     * Статус в одну строку — для GUI.
+     */
+    public String getStatusString() {
+        return switch (phase) {
+            case IDLE                   -> "§8Ожидание...";
+            case WAITING_FOR_WORKBENCH  -> "§eЖду верстак... (" + (workbenchWaitTicks / 20) + "с)";
+            case CRAFTING               -> paused ? "§ePAUSED " : "§aCRAFTING ";
+            case FINISHING              -> "§7Завершение...";
+        };
     }
 
     // ── Вспомогательные ───────────────────────────────────────────────────────
