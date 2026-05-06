@@ -1,5 +1,6 @@
 package net.autocraft;
 
+import net.autocraft.command.AutoCraftCommand;
 import net.autocraft.config.AutoCraftConfig;
 import net.autocraft.crafting.CraftingManager;
 import net.autocraft.gui.AutoCraftScreen;
@@ -18,8 +19,9 @@ import org.slf4j.LoggerFactory;
  * Точка входа клиентского мода.
  *
  * Регистрирует:
- *  - keybind (клавиша O) → открыть AutoCraftScreen
- *  - tick handler → тикает CraftingManager каждый клиентский тик
+ *  - keybind (клавиша O)  → открыть AutoCraftScreen
+ *  - команду /crafter     → открыть AutoCraftScreen / управление
+ *  - tick handler         → тикает CraftingManager каждый клиентский тик
  */
 public class AutoCraftMod implements ClientModInitializer {
 
@@ -38,52 +40,44 @@ public class AutoCraftMod implements ClientModInitializer {
 
         // 2. Зарегистрировать keybind
         openGuiKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
-                "key.autocraft.open_gui",       // translation key (en_us.json)
-                InputUtil.Type.KEYSYM,           // тип: клавиша клавиатуры
-                GLFW.GLFW_KEY_O,                 // клавиша O по умолчанию
-                "category.autocraft.main"        // категория в настройках управления
+                "key.autocraft.open_gui",
+                InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_O,
+                "category.autocraft.main"
         ));
 
-        // 3. Tick handler
+        // 3. Зарегистрировать команду /crafter
+        AutoCraftCommand.register();
+
+        // 4. Tick handler
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             handleKeybind(client);
             CraftingManager.getInstance().tick(client);
         });
 
-        LOGGER.info("[AutoCraft] Готов. Нажми [O] для открытия GUI.");
+        LOGGER.info("[AutoCraft] Готов. [O] или /crafter для открытия GUI.");
     }
 
-    // ── Обработчик нажатия клавиши ────────────────────────────────────────────
+    // ── Обработчик клавиши ────────────────────────────────────────────────────
 
-    /**
-     * Вызывается каждый тик.
-     *
-     * Логика:
-     *  - wasPressed() сбрасывает флаг нажатия — безопасно вызывать в цикле
-     *  - проверяем что игрок существует (не в главном меню)
-     *  - проверяем что AutoCraftScreen ещё не открыт — не открываем второй раз
-     *  - проверяем что нет другого открытого экрана (инвентарь, верстак и т.д.)
-     */
     private void handleKeybind(MinecraftClient client) {
-        // wasPressed() — возвращает true и сбрасывает счётчик нажатий
         while (openGuiKey.wasPressed()) {
 
             // Игрок должен быть в мире
             if (client.player == null) return;
 
-            Screen currentScreen = client.currentScreen;
+            Screen current = client.currentScreen;
 
-            // Если AutoCraftScreen уже открыт — закрываем его (toggle)
-            if (currentScreen instanceof AutoCraftScreen) {
+            // Toggle — если уже открыт, закрыть
+            if (current instanceof AutoCraftScreen) {
                 client.setScreen(null);
                 return;
             }
 
-            // Если открыт любой другой экран — не перебиваем его
-            if (currentScreen != null) return;
+            // Не перебивать другие экраны
+            if (current != null) return;
 
-            // Открываем GUI
-            LOGGER.debug("[AutoCraft] Открываю AutoCraftScreen по нажатию [O]");
+            LOGGER.debug("[AutoCraft] Открываю AutoCraftScreen по [O]");
             client.setScreen(new AutoCraftScreen());
         }
     }
